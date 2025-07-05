@@ -72,25 +72,20 @@ public class RelativeVigorIndex : BaseComplexIndicator<RelativeVigorIndexValue>
 /// <summary>
 /// <see cref="RelativeVigorIndex"/> indicator value.
 /// </summary>
-public class RelativeVigorIndexValue : ComplexIndicatorValue<RelativeVigorIndex>
+/// <remarks>
+/// Initializes a new instance of the <see cref="RelativeVigorIndexValue"/>.
+/// </remarks>
+/// <param name="indicator"><see cref="RelativeVigorIndex"/></param>
+/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
+public class RelativeVigorIndexValue(RelativeVigorIndex indicator, DateTimeOffset time) : ComplexIndicatorValue<RelativeVigorIndex>(indicator, time)
 {
-	/// <summary>
-	/// Initializes a new instance of the <see cref="RelativeVigorIndexValue"/>.
-	/// </summary>
-	/// <param name="indicator"><see cref="RelativeVigorIndex"/></param>
-	/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
-	public RelativeVigorIndexValue(RelativeVigorIndex indicator, DateTimeOffset time)
-		: base(indicator, time)
-	{
-	}
-
 	/// <summary>
 	/// Gets the <see cref="RelativeVigorIndex.Average"/> value.
 	/// </summary>
-	public decimal Average => InnerValues[TypedIndicator.Average].ToDecimal();
+	public decimal? Average => GetInnerDecimal(TypedIndicator.Average);
 
 	/// <summary>
 	/// Gets the <see cref="RelativeVigorIndex.Signal"/> value.
 	/// </summary>
-	public decimal Signal => InnerValues[TypedIndicator.Signal].ToDecimal();
+	public decimal? Signal => GetInnerDecimal(TypedIndicator.Signal);
 }

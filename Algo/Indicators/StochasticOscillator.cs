@@ -61,25 +61,20 @@ public class StochasticOscillator : BaseComplexIndicator<StochasticOscillatorVal
 /// <summary>
 /// <see cref="StochasticOscillator"/> indicator value.
 /// </summary>
-public class StochasticOscillatorValue : ComplexIndicatorValue<StochasticOscillator>
+/// <remarks>
+/// Initializes a new instance of the <see cref="StochasticOscillatorValue"/>.
+/// </remarks>
+/// <param name="indicator"><see cref="StochasticOscillator"/></param>
+/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
+public class StochasticOscillatorValue(StochasticOscillator indicator, DateTimeOffset time) : ComplexIndicatorValue<StochasticOscillator>(indicator, time)
 {
-	/// <summary>
-	/// Initializes a new instance of the <see cref="StochasticOscillatorValue"/>.
-	/// </summary>
-	/// <param name="indicator"><see cref="StochasticOscillator"/></param>
-	/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
-	public StochasticOscillatorValue(StochasticOscillator indicator, DateTimeOffset time)
-		: base(indicator, time)
-	{
-	}
-
 	/// <summary>
 	/// Gets the %K value.
 	/// </summary>
-	public decimal KValue => InnerValues[TypedIndicator.K].ToDecimal();
+	public decimal? K => GetInnerDecimal(TypedIndicator.K);
 
 	/// <summary>
 	/// Gets the %D value.
 	/// </summary>
-	public decimal DValue => InnerValues[TypedIndicator.D].ToDecimal();
+	public decimal? D => GetInnerDecimal(TypedIndicator.D);
 }

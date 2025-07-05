@@ -183,25 +183,20 @@ public class KasePeakOscillatorPart : LengthIndicator<decimal>
 /// <summary>
 /// <see cref="KasePeakOscillator"/> indicator value.
 /// </summary>
-public class KasePeakOscillatorValue : ComplexIndicatorValue<KasePeakOscillator>
+/// <remarks>
+/// Initializes a new instance of the <see cref="KasePeakOscillatorValue"/>.
+/// </remarks>
+/// <param name="indicator"><see cref="KasePeakOscillator"/></param>
+/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
+public class KasePeakOscillatorValue(KasePeakOscillator indicator, DateTimeOffset time) : ComplexIndicatorValue<KasePeakOscillator>(indicator, time)
 {
-	/// <summary>
-	/// Initializes a new instance of the <see cref="KasePeakOscillatorValue"/>.
-	/// </summary>
-	/// <param name="indicator"><see cref="KasePeakOscillator"/></param>
-	/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
-	public KasePeakOscillatorValue(KasePeakOscillator indicator, DateTimeOffset time)
-		: base(indicator, time)
-	{
-	}
-
 	/// <summary>
 	/// Gets the <see cref="KasePeakOscillator.ShortTerm"/> value.
 	/// </summary>
-	public decimal ShortTerm => InnerValues[TypedIndicator.ShortTerm].ToDecimal();
+	public decimal? ShortTerm => GetInnerDecimal(TypedIndicator.ShortTerm);
 
 	/// <summary>
 	/// Gets the <see cref="KasePeakOscillator.LongTerm"/> value.
 	/// </summary>
-	public decimal LongTerm => InnerValues[TypedIndicator.LongTerm].ToDecimal();
+	public decimal? LongTerm => GetInnerDecimal(TypedIndicator.LongTerm);
 }

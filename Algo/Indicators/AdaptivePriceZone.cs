@@ -172,30 +172,25 @@ public class AdaptivePriceZoneBand : BaseIndicator
 /// <summary>
 /// <see cref="AdaptivePriceZone"/> indicator value.
 /// </summary>
-public class AdaptivePriceZoneValue : ComplexIndicatorValue<AdaptivePriceZone>
+/// <remarks>
+/// Initializes a new instance of the <see cref="AdaptivePriceZoneValue"/>.
+/// </remarks>
+/// <param name="indicator"><see cref="AdaptivePriceZone"/></param>
+/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
+public class AdaptivePriceZoneValue(AdaptivePriceZone indicator, DateTimeOffset time) : ComplexIndicatorValue<AdaptivePriceZone>(indicator, time)
 {
-	/// <summary>
-	/// Initializes a new instance of the <see cref="AdaptivePriceZoneValue"/>.
-	/// </summary>
-	/// <param name="indicator"><see cref="AdaptivePriceZone"/></param>
-	/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
-	public AdaptivePriceZoneValue(AdaptivePriceZone indicator, DateTimeOffset time)
-		: base(indicator, time)
-	{
-	}
-
 	/// <summary>
 	/// Gets the moving average value.
 	/// </summary>
-	public decimal MovingAverage => InnerValues[TypedIndicator.Ma].ToDecimal();
+	public decimal? MovingAverage => GetInnerDecimal(TypedIndicator.Ma);
 
 	/// <summary>
 	/// Gets the upper band value.
 	/// </summary>
-	public decimal UpperBand => InnerValues[TypedIndicator.UpperBand].ToDecimal();
+	public decimal? UpperBand => GetInnerDecimal(TypedIndicator.UpperBand);
 
 	/// <summary>
 	/// Gets the lower band value.
 	/// </summary>
-	public decimal LowerBand => InnerValues[TypedIndicator.LowerBand].ToDecimal();
+	public decimal? LowerBand => GetInnerDecimal(TypedIndicator.LowerBand);
 }

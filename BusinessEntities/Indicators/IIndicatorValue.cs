@@ -61,7 +61,6 @@ public interface IIndicatorValue : IComparable<IIndicatorValue>, IComparable
 /// <param name="time"><see cref="IIndicatorValue.Time"/></param>
 public abstract class BaseIndicatorValue(IIndicator indicator, DateTimeOffset time) : IIndicatorValue
 {
-
 	/// <inheritdoc />
 	public IIndicator Indicator { get; } = indicator ?? throw new ArgumentNullException(nameof(indicator));
 
@@ -86,12 +85,10 @@ public abstract class BaseIndicatorValue(IIndicator indicator, DateTimeOffset ti
 	/// <inheritdoc />
 	int IComparable.CompareTo(object other)
 	{
-		var value = other as IIndicatorValue;
-
-		if (other == null)
+		if (other is not IIndicatorValue v)
 			throw new ArgumentOutOfRangeException(nameof(other), other, LocalizedStrings.InvalidValue);
 
-		return CompareTo(value);
+		return CompareTo(v);
 	}
 
 	/// <inheritdoc />
@@ -560,7 +557,7 @@ public interface IComplexIndicatorValue : IIndicatorValue
 /// <param name="indicator">Indicator.</param>
 /// <param name="time"><see cref="IIndicatorValue.Time"/></param>
 public abstract class ComplexIndicatorValue<TIndicator>(TIndicator indicator, DateTimeOffset time) : BaseIndicatorValue(indicator, time), IComplexIndicatorValue
-	where TIndicator : class, IComplexIndicator
+	where TIndicator : IComplexIndicator
 {
 	/// <summary>
 	/// The complex indicator, based on which the value is calculated.
@@ -594,7 +591,7 @@ public abstract class ComplexIndicatorValue<TIndicator>(TIndicator indicator, Da
 	/// <inheritdoc />
 	public override T GetValue<T>(Level1Fields? field)
 	{
-		if (InnerValues.TryGetValue(TypedIndicator, out var value))
+		if (TryGet(TypedIndicator, out var value))
 			return value.GetValue<T>(field);
 
 		throw new NotSupportedException();
@@ -631,4 +628,23 @@ public abstract class ComplexIndicatorValue<TIndicator>(TIndicator indicator, Da
 		foreach (var inner in TypedIndicator.InnerIndicators)
 			InnerValues.Add(inner, inner.CreateValue(Time, values[idx++].To<object[]>()));
 	}
+
+	/// <summary>
+	/// Get the inner value of the indicator as <see cref="decimal"/>.
+	/// </summary>
+	/// <param name="indicator">Inner indicator, for which the value is requested.</param>
+	/// <returns>Inner value of the indicator as <see cref="decimal"/> or <see langword="null"/> if the value is empty.</returns>
+	public decimal? GetInnerDecimal(IIndicator indicator)
+		=> InnerValues[indicator].ToNullableDecimal();
+
+	/// <summary>
+	/// Set the inner value of the indicator as <see cref="decimal"/>.
+	/// </summary>
+	/// <param name="indicator">Inner indicator, for which the value is set.</param>
+	/// <param name="time">Time of the value, which is set.</param>
+	/// <param name="value">Value of the indicator as <see cref="decimal"/> or <see langword="null"/> if the value is empty.</param>
+	public void SetInnerDecimal(IIndicator indicator, DateTimeOffset time, decimal? value)
+		=> InnerValues[indicator] = value is not decimal v
+		? new DecimalIndicatorValue(indicator, time)
+		: new DecimalIndicatorValue(indicator, v, time);
 }

@@ -195,25 +195,20 @@ public class VortexPart : LengthIndicator<decimal>
 /// <summary>
 /// <see cref="VortexIndicator"/> indicator value.
 /// </summary>
-public class VortexIndicatorValue : ComplexIndicatorValue<VortexIndicator>
+/// <remarks>
+/// Initializes a new instance of the <see cref="VortexIndicatorValue"/>.
+/// </remarks>
+/// <param name="indicator"><see cref="VortexIndicator"/></param>
+/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
+public class VortexIndicatorValue(VortexIndicator indicator, DateTimeOffset time) : ComplexIndicatorValue<VortexIndicator>(indicator, time)
 {
-	/// <summary>
-	/// Initializes a new instance of the <see cref="VortexIndicatorValue"/>.
-	/// </summary>
-	/// <param name="indicator"><see cref="VortexIndicator"/></param>
-	/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
-	public VortexIndicatorValue(VortexIndicator indicator, DateTimeOffset time)
-		: base(indicator, time)
-	{
-	}
-
 	/// <summary>
 	/// Gets the <see cref="VortexIndicator.PlusVi"/> value.
 	/// </summary>
-	public decimal PlusVi => InnerValues[TypedIndicator.PlusVi].ToDecimal();
+	public decimal? PlusVi => GetInnerDecimal(TypedIndicator.PlusVi);
 
 	/// <summary>
 	/// Gets the <see cref="VortexIndicator.MinusVi"/> value.
 	/// </summary>
-	public decimal MinusVi => InnerValues[TypedIndicator.MinusVi].ToDecimal();
+	public decimal? MinusVi => GetInnerDecimal(TypedIndicator.MinusVi);
 }

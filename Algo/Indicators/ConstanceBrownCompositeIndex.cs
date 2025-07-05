@@ -117,8 +117,10 @@ public class ConstanceBrownCompositeIndex : BaseComplexIndicator<ConstanceBrownC
 				IsFormed = true;
 
 			var rsi = rsiValue.ToDecimal();
-			var stochK = stochValue.KValue;
-			var stochD = stochValue.DValue;
+
+			if (stochValue.K is not decimal stochK ||
+				stochValue.D is not decimal stochD)
+				return result;
 
 			var cbci = (rsi + stochK + stochD) / 3;
 
@@ -152,30 +154,25 @@ public class CompositeIndexLine : BaseIndicator
 /// <summary>
 /// <see cref="ConstanceBrownCompositeIndex"/> indicator value.
 /// </summary>
-public class ConstanceBrownCompositeIndexValue : ComplexIndicatorValue<ConstanceBrownCompositeIndex>
+/// <remarks>
+/// Initializes a new instance of the <see cref="ConstanceBrownCompositeIndexValue"/>.
+/// </remarks>
+/// <param name="indicator"><see cref="ConstanceBrownCompositeIndex"/></param>
+/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
+public class ConstanceBrownCompositeIndexValue(ConstanceBrownCompositeIndex indicator, DateTimeOffset time) : ComplexIndicatorValue<ConstanceBrownCompositeIndex>(indicator, time)
 {
-	/// <summary>
-	/// Initializes a new instance of the <see cref="ConstanceBrownCompositeIndexValue"/>.
-	/// </summary>
-	/// <param name="indicator"><see cref="ConstanceBrownCompositeIndex"/></param>
-	/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
-	public ConstanceBrownCompositeIndexValue(ConstanceBrownCompositeIndex indicator, DateTimeOffset time)
-		: base(indicator, time)
-	{
-	}
-
 	/// <summary>
 	/// Gets the RSI component.
 	/// </summary>
-	public decimal Rsi => InnerValues[TypedIndicator.Rsi].ToDecimal();
+	public decimal? Rsi => GetInnerDecimal(TypedIndicator.Rsi);
 
 	/// <summary>
 	/// Gets the stochastic component.
 	/// </summary>
-	public decimal Stoch => InnerValues[TypedIndicator.Stoch].ToDecimal();
+	public decimal? Stoch => GetInnerDecimal(TypedIndicator.Stoch);
 
 	/// <summary>
 	/// Gets the composite index line.
 	/// </summary>
-	public decimal CompositeIndexLine => InnerValues[TypedIndicator.CompositeIndexLine].ToDecimal();
+	public decimal? CompositeIndexLine => GetInnerDecimal(TypedIndicator.CompositeIndexLine);
 }

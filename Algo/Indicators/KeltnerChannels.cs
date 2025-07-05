@@ -178,30 +178,25 @@ public class KeltnerChannelBand : LengthIndicator<decimal>
 /// <summary>
 /// <see cref="KeltnerChannels"/> indicator value.
 /// </summary>
-public class KeltnerChannelsValue : ComplexIndicatorValue<KeltnerChannels>
+/// <remarks>
+/// Initializes a new instance of the <see cref="KeltnerChannelsValue"/>.
+/// </remarks>
+/// <param name="indicator"><see cref="KeltnerChannels"/></param>
+/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
+public class KeltnerChannelsValue(KeltnerChannels indicator, DateTimeOffset time) : ComplexIndicatorValue<KeltnerChannels>(indicator, time)
 {
-	/// <summary>
-	/// Initializes a new instance of the <see cref="KeltnerChannelsValue"/>.
-	/// </summary>
-	/// <param name="indicator"><see cref="KeltnerChannels"/></param>
-	/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
-	public KeltnerChannelsValue(KeltnerChannels indicator, DateTimeOffset time)
-		: base(indicator, time)
-	{
-	}
-
 	/// <summary>
 	/// Gets the <see cref="KeltnerChannels.Middle"/> value.
 	/// </summary>
-	public decimal Middle => InnerValues[TypedIndicator.Middle].ToDecimal();
+	public decimal? Middle => GetInnerDecimal(TypedIndicator.Middle);
 
 	/// <summary>
 	/// Gets the <see cref="KeltnerChannels.Upper"/> value.
 	/// </summary>
-	public decimal Upper => InnerValues[TypedIndicator.Upper].ToDecimal();
+	public decimal? Upper => GetInnerDecimal(TypedIndicator.Upper);
 
 	/// <summary>
 	/// Gets the <see cref="KeltnerChannels.Lower"/> value.
 	/// </summary>
-	public decimal Lower => InnerValues[TypedIndicator.Lower].ToDecimal();
+	public decimal? Lower => GetInnerDecimal(TypedIndicator.Lower);
 }

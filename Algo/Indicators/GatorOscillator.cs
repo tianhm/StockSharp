@@ -75,25 +75,20 @@ public class GatorOscillator : BaseComplexIndicator<GatorOscillatorValue>
 /// <summary>
 /// <see cref="GatorOscillator"/> indicator value.
 /// </summary>
-public class GatorOscillatorValue : ComplexIndicatorValue<GatorOscillator>
+/// <remarks>
+/// Initializes a new instance of the <see cref="GatorOscillatorValue"/>.
+/// </remarks>
+/// <param name="indicator"><see cref="GatorOscillator"/></param>
+/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
+public class GatorOscillatorValue(GatorOscillator indicator, DateTimeOffset time) : ComplexIndicatorValue<GatorOscillator>(indicator, time)
 {
-	/// <summary>
-	/// Initializes a new instance of the <see cref="GatorOscillatorValue"/>.
-	/// </summary>
-	/// <param name="indicator"><see cref="GatorOscillator"/></param>
-	/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
-	public GatorOscillatorValue(GatorOscillator indicator, DateTimeOffset time)
-		: base(indicator, time)
-	{
-	}
-
 	/// <summary>
 	/// Gets the <see cref="GatorOscillator.Histogram1"/> value.
 	/// </summary>
-	public decimal Histogram1 => InnerValues[TypedIndicator.Histogram1].ToDecimal();
+	public decimal? Histogram1 => GetInnerDecimal(TypedIndicator.Histogram1);
 
 	/// <summary>
 	/// Gets the <see cref="GatorOscillator.Histogram2"/> value.
 	/// </summary>
-	public decimal Histogram2 => InnerValues[TypedIndicator.Histogram2].ToDecimal();
+	public decimal? Histogram2 => GetInnerDecimal(TypedIndicator.Histogram2);
 }
