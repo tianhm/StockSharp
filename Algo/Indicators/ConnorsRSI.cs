@@ -232,35 +232,30 @@ public class CrsiLine : BaseIndicator
 /// <summary>
 /// <see cref="ConnorsRSI"/> indicator value.
 /// </summary>
-public class ConnorsRSIValue : ComplexIndicatorValue<ConnorsRSI>
+/// <remarks>
+/// Initializes a new instance of the <see cref="ConnorsRSIValue"/>.
+/// </remarks>
+/// <param name="indicator"><see cref="ConnorsRSI"/></param>
+/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
+public class ConnorsRSIValue(ConnorsRSI indicator, DateTimeOffset time) : ComplexIndicatorValue<ConnorsRSI>(indicator, time)
 {
-	/// <summary>
-	/// Initializes a new instance of the <see cref="ConnorsRSIValue"/>.
-	/// </summary>
-	/// <param name="indicator"><see cref="ConnorsRSI"/></param>
-	/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
-	public ConnorsRSIValue(ConnorsRSI indicator, DateTimeOffset time)
-		: base(indicator, time)
-	{
-	}
-
 	/// <summary>
 	/// Gets the RSI component.
 	/// </summary>
-	public decimal Rsi => InnerValues[TypedIndicator.Rsi].ToDecimal();
+	public decimal? Rsi => GetInnerDecimal(TypedIndicator.Rsi);
 
 	/// <summary>
 	/// Gets the UpDown RSI component.
 	/// </summary>
-	public decimal UpDownRsi => InnerValues[TypedIndicator.UpDownRsi].ToDecimal();
+	public decimal? UpDownRsi => GetInnerDecimal(TypedIndicator.UpDownRsi);
 
 	/// <summary>
 	/// Gets the ROC RSI component.
 	/// </summary>
-	public decimal RocRsi => InnerValues[TypedIndicator.RocRsi].ToDecimal();
+	public decimal? RocRsi => GetInnerDecimal(TypedIndicator.RocRsi);
 
 	/// <summary>
 	/// Gets the composite RSI line.
 	/// </summary>
-	public decimal CrsiLine => InnerValues[TypedIndicator.CrsiLine].ToDecimal();
+	public decimal? CrsiLine => GetInnerDecimal(TypedIndicator.CrsiLine);
 }

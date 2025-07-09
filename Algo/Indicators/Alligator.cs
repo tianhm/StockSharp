@@ -85,30 +85,25 @@ public class Alligator : BaseComplexIndicator<AlligatorValue>
 /// <summary>
 /// <see cref="Alligator"/> indicator value.
 /// </summary>
-public class AlligatorValue : ComplexIndicatorValue<Alligator>
+/// <remarks>
+/// Initializes a new instance of the <see cref="AlligatorValue"/>.
+/// </remarks>
+/// <param name="indicator"><see cref="Alligator"/></param>
+/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
+public class AlligatorValue(Alligator indicator, DateTimeOffset time) : ComplexIndicatorValue<Alligator>(indicator, time)
 {
-	/// <summary>
-	/// Initializes a new instance of the <see cref="AlligatorValue"/>.
-	/// </summary>
-	/// <param name="indicator"><see cref="Alligator"/></param>
-	/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
-	public AlligatorValue(Alligator indicator, DateTimeOffset time)
-		: base(indicator, time)
-	{
-	}
-
 	/// <summary>
 	/// Gets the <see cref="Alligator.Jaw"/> value.
 	/// </summary>
-	public decimal Jaw => InnerValues[TypedIndicator.Jaw].ToDecimal();
+	public decimal? Jaw => GetInnerDecimal(TypedIndicator.Jaw);
 
 	/// <summary>
 	/// Gets the <see cref="Alligator.Teeth"/> value.
 	/// </summary>
-	public decimal Teeth => InnerValues[TypedIndicator.Teeth].ToDecimal();
+	public decimal? Teeth => GetInnerDecimal(TypedIndicator.Teeth);
 
 	/// <summary>
 	/// Gets the <see cref="Alligator.Lips"/> value.
 	/// </summary>
-	public decimal Lips => InnerValues[TypedIndicator.Lips].ToDecimal();
+	public decimal? Lips => GetInnerDecimal(TypedIndicator.Lips);
 }

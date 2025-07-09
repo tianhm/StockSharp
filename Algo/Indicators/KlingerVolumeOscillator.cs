@@ -125,30 +125,25 @@ public class KlingerVolumeOscillator : BaseComplexIndicator<KlingerVolumeOscilla
 /// <summary>
 /// <see cref="KlingerVolumeOscillator"/> indicator value.
 /// </summary>
-public class KlingerVolumeOscillatorValue : ComplexIndicatorValue<KlingerVolumeOscillator>
+/// <remarks>
+/// Initializes a new instance of the <see cref="KlingerVolumeOscillatorValue"/>.
+/// </remarks>
+/// <param name="indicator"><see cref="KlingerVolumeOscillator"/></param>
+/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
+public class KlingerVolumeOscillatorValue(KlingerVolumeOscillator indicator, DateTimeOffset time) : ComplexIndicatorValue<KlingerVolumeOscillator>(indicator, time)
 {
-	/// <summary>
-	/// Initializes a new instance of the <see cref="KlingerVolumeOscillatorValue"/>.
-	/// </summary>
-	/// <param name="indicator"><see cref="KlingerVolumeOscillator"/></param>
-	/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
-	public KlingerVolumeOscillatorValue(KlingerVolumeOscillator indicator, DateTimeOffset time)
-		: base(indicator, time)
-	{
-	}
-
 	/// <summary>
 	/// Gets the short EMA value.
 	/// </summary>
-	public decimal ShortEma => InnerValues[TypedIndicator.ShortEma].ToDecimal();
+	public decimal? ShortEma => GetInnerDecimal(TypedIndicator.ShortEma);
 
 	/// <summary>
 	/// Gets the long EMA value.
 	/// </summary>
-	public decimal LongEma => InnerValues[TypedIndicator.LongEma].ToDecimal();
+	public decimal? LongEma => GetInnerDecimal(TypedIndicator.LongEma);
 
 	/// <summary>
 	/// Gets the oscillator value.
 	/// </summary>
-	public decimal Oscillator => InnerValues[TypedIndicator].ToDecimal();
+	public decimal? Oscillator => GetInnerDecimal(TypedIndicator);
 }

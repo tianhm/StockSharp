@@ -100,11 +100,8 @@ public class Envelope : BaseComplexIndicator<EnvelopeValue>
 	{
 		var value = (EnvelopeValue)base.OnProcess(input);
 
-		var upper = value[Upper];
-		value[Upper] = upper.SetValue(Upper, value.Upper * (1 + Shift));
-
-		var lower = value[Lower];
-		value[Lower] = lower.SetValue(Lower, value.Lower * (1 - Shift));
+		value.SetInnerDecimal(Upper, input.Time, value.Upper * (1 + Shift));
+		value.SetInnerDecimal(Lower, input.Time, value.Lower * (1 - Shift));
 
 		return value;
 	}
@@ -134,30 +131,25 @@ public class Envelope : BaseComplexIndicator<EnvelopeValue>
 /// <summary>
 /// <see cref="Envelope"/> indicator value.
 /// </summary>
-public class EnvelopeValue : ComplexIndicatorValue<Envelope>
+/// <remarks>
+/// Initializes a new instance of the <see cref="EnvelopeValue"/>.
+/// </remarks>
+/// <param name="indicator"><see cref="Envelope"/></param>
+/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
+public class EnvelopeValue(Envelope indicator, DateTimeOffset time) : ComplexIndicatorValue<Envelope>(indicator, time)
 {
-	/// <summary>
-	/// Initializes a new instance of the <see cref="EnvelopeValue"/>.
-	/// </summary>
-	/// <param name="indicator"><see cref="Envelope"/></param>
-	/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
-	public EnvelopeValue(Envelope indicator, DateTimeOffset time)
-		: base(indicator, time)
-	{
-	}
-
 	/// <summary>
 	/// Gets the <see cref="Envelope.Middle"/> value.
 	/// </summary>
-	public decimal Middle => InnerValues[TypedIndicator.Middle].ToDecimal();
+	public decimal? Middle => GetInnerDecimal(TypedIndicator.Middle);
 
 	/// <summary>
 	/// Gets the <see cref="Envelope.Upper"/> value.
 	/// </summary>
-	public decimal Upper => InnerValues[TypedIndicator.Upper].ToDecimal();
+	public decimal? Upper => GetInnerDecimal(TypedIndicator.Upper);
 
 	/// <summary>
 	/// Gets the <see cref="Envelope.Lower"/> value.
 	/// </summary>
-	public decimal Lower => InnerValues[TypedIndicator.Lower].ToDecimal();
+	public decimal? Lower => GetInnerDecimal(TypedIndicator.Lower);
 }

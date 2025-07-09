@@ -3,18 +3,13 @@
 /// <summary>
 /// <see cref="Fractals"/> indicator value.
 /// </summary>
-public class FractalsValue : ComplexIndicatorValue<Fractals>
+/// <remarks>
+/// Initializes a new instance of the <see cref="FractalsValue"/>.
+/// </remarks>
+/// <param name="fractals"><see cref="Fractals"/></param>
+/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
+public class FractalsValue(Fractals fractals, DateTimeOffset time) : ComplexIndicatorValue<Fractals>(fractals, time)
 {
-	/// <summary>
-	/// Initializes a new instance of the <see cref="FractalsValue"/>.
-	/// </summary>
-	/// <param name="fractals"><see cref="Fractals"/></param>
-	/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
-	public FractalsValue(Fractals fractals, DateTimeOffset time)
-		: base(fractals, time)
-	{
-	}
-
 	/// <summary>
 	/// Has pattern.
 	/// </summary>
@@ -33,12 +28,12 @@ public class FractalsValue : ComplexIndicatorValue<Fractals>
 	/// <summary>
 	/// Gets the <see cref="Fractals.Up"/> value.
 	/// </summary>
-	public decimal Up => InnerValues[TypedIndicator.Up].ToDecimal();
+	public decimal? Up => GetInnerDecimal(TypedIndicator.Up);
 
 	/// <summary>
 	/// Gets the <see cref="Fractals.Down"/> value.
 	/// </summary>
-	public decimal Down => InnerValues[TypedIndicator.Down].ToDecimal();
+	public decimal? Down => GetInnerDecimal(TypedIndicator.Down);
 
 	/// <summary>
 	/// Cast object from <see cref="FractalsValue"/> to <see cref="bool"/>.

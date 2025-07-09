@@ -119,25 +119,20 @@ public class KnowSureThingLine : BaseIndicator
 /// <summary>
 /// <see cref="KnowSureThing"/> indicator value.
 /// </summary>
-public class KnowSureThingValue : ComplexIndicatorValue<KnowSureThing>
+/// <remarks>
+/// Initializes a new instance of the <see cref="KnowSureThingValue"/>.
+/// </remarks>
+/// <param name="indicator"><see cref="KnowSureThing"/></param>
+/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
+public class KnowSureThingValue(KnowSureThing indicator, DateTimeOffset time) : ComplexIndicatorValue<KnowSureThing>(indicator, time)
 {
-	/// <summary>
-	/// Initializes a new instance of the <see cref="KnowSureThingValue"/>.
-	/// </summary>
-	/// <param name="indicator"><see cref="KnowSureThing"/></param>
-	/// <param name="time"><see cref="IIndicatorValue.Time"/></param>
-	public KnowSureThingValue(KnowSureThing indicator, DateTimeOffset time)
-		: base(indicator, time)
-	{
-	}
-
 	/// <summary>
 	/// Gets the KST line value.
 	/// </summary>
-	public decimal KstLine => InnerValues[TypedIndicator.KstLine].ToDecimal();
+	public decimal? KstLine => GetInnerDecimal(TypedIndicator.KstLine);
 
 	/// <summary>
 	/// Gets the signal line value.
 	/// </summary>
-	public decimal Signal => InnerValues[TypedIndicator.Signal].ToDecimal();
+	public decimal? Signal => GetInnerDecimal(TypedIndicator.Signal);
 }
