@@ -65,6 +65,17 @@ public class DummyChartBuilder : IChartBuilder
 			XAxisId = storage.GetValue<string>(nameof(XAxisId));
 			YAxisId = storage.GetValue<string>(nameof(YAxisId));
 		}
+
+		public override void Save(SettingsStorage storage)
+		{
+			base.Save(storage);
+
+			storage.SetValue(nameof(FullTitle), FullTitle);
+			storage.SetValue(nameof(IsVisible), IsVisible);
+			storage.SetValue(nameof(IsLegend), IsLegend);
+			storage.SetValue(nameof(XAxisId), XAxisId);
+			storage.SetValue(nameof(YAxisId), YAxisId);
+		}
 	}
 
 	private class DummyActiveOrdersElement : DummyElement, IChartActiveOrdersElement
@@ -95,6 +106,22 @@ public class DummyChartBuilder : IChartBuilder
 			CancelButtonBackground = storage.GetValue<int>(nameof(CancelButtonBackground)).ToColor();
 			IsAnimationEnabled = storage.GetValue<bool>(nameof(IsAnimationEnabled));
 		}
+
+		public override void Save(SettingsStorage storage)
+		{
+			base.Save(storage);
+
+			storage.SetValue(nameof(BuyColor), BuyColor.ToArgb());
+			storage.SetValue(nameof(BuyBlinkColor), BuyBlinkColor.ToArgb());
+			storage.SetValue(nameof(BuyPendingColor), BuyPendingColor.ToArgb());
+			storage.SetValue(nameof(SellColor), SellColor.ToArgb());
+			storage.SetValue(nameof(SellBlinkColor), SellBlinkColor.ToArgb());
+			storage.SetValue(nameof(SellPendingColor), SellPendingColor.ToArgb());
+			storage.SetValue(nameof(ForegroundColor), ForegroundColor.ToArgb());
+			storage.SetValue(nameof(CancelButtonColor), CancelButtonColor.ToArgb());
+			storage.SetValue(nameof(CancelButtonBackground), CancelButtonBackground.ToArgb());
+			storage.SetValue(nameof(IsAnimationEnabled), IsAnimationEnabled);
+		}
 	}
 
 	private class DummyAnnotationElement : DummyElement, IChartAnnotationElement
@@ -106,6 +133,13 @@ public class DummyChartBuilder : IChartBuilder
 			base.Load(storage);
 
 			Type = storage.GetValue<ChartAnnotationTypes>(nameof(Type));
+		}
+
+		public override void Save(SettingsStorage storage)
+		{
+			base.Save(storage);
+
+			storage.SetValue(nameof(Type), Type);
 		}
 	}
 
@@ -142,6 +176,16 @@ public class DummyChartBuilder : IChartBuilder
 			GroupId = storage.GetValue<string>(nameof(GroupId));
 			Height = storage.GetValue<double>(nameof(Height));
 			XAxisType = storage.GetValue<ChartAxisType>(nameof(XAxisType));
+		}
+
+		public override void Save(SettingsStorage storage)
+		{
+			base.Save(storage);
+
+			storage.SetValue(nameof(Title), Title);
+			storage.SetValue(nameof(GroupId), GroupId);
+			storage.SetValue(nameof(Height), Height);
+			storage.SetValue(nameof(XAxisType), XAxisType);
 		}
 	}
 
@@ -249,12 +293,24 @@ public class DummyChartBuilder : IChartBuilder
 		{
 			base.Load(storage);
 
-			//Color = storage.GetValue<int>(nameof(Color)).ToColor();
-			//AdditionalColor = storage.GetValue<int>(nameof(AdditionalColor)).ToColor();
+			Color = storage.GetValue<int>(nameof(Color)).ToColor();
+			AdditionalColor = storage.GetValue<int>(nameof(AdditionalColor)).ToColor();
 			StrokeThickness = storage.GetValue<int>(nameof(StrokeThickness));
 			AntiAliasing = storage.GetValue<bool>(nameof(AntiAliasing));
 			Style = storage.GetValue<DrawStyles>(nameof(Style));
 			ShowAxisMarker = storage.GetValue<bool>(nameof(ShowAxisMarker));
+		}
+
+		public override void Save(SettingsStorage storage)
+		{
+			base.Save(storage);
+
+			storage.SetValue(nameof(Color), Color.ToArgb());
+			storage.SetValue(nameof(AdditionalColor), AdditionalColor.ToArgb());
+			storage.SetValue(nameof(StrokeThickness), StrokeThickness);
+			storage.SetValue(nameof(AntiAliasing), AntiAliasing);
+			storage.SetValue(nameof(Style), Style);
+			storage.SetValue(nameof(ShowAxisMarker), ShowAxisMarker);
 		}
 	}
 
@@ -332,6 +388,43 @@ public class DummyChartBuilder : IChartBuilder
 			BuyColor = storage.GetValue<int?>(nameof(BuyColor))?.ToColor();
 			SellColor = storage.GetValue<int?>(nameof(SellColor))?.ToColor();
 		}
+
+		public override void Save(SettingsStorage storage)
+		{
+			base.Save(storage);
+
+			storage.SetValue(nameof(DrawStyle), DrawStyle);
+			storage.SetValue(nameof(UpFillColor), UpFillColor.ToArgb());
+			storage.SetValue(nameof(UpBorderColor), UpBorderColor.ToArgb());
+			storage.SetValue(nameof(DownFillColor), DownFillColor.ToArgb());
+			storage.SetValue(nameof(DownBorderColor), DownBorderColor.ToArgb());
+			storage.SetValue(nameof(LineColor), LineColor?.ToArgb());
+			storage.SetValue(nameof(AreaColor), AreaColor?.ToArgb());
+			storage.SetValue(nameof(StrokeThickness), StrokeThickness);
+			storage.SetValue(nameof(AntiAliasing), AntiAliasing);
+			storage.SetValue(nameof(ShowAxisMarker), ShowAxisMarker);
+			storage.SetValue(nameof(Timeframe2Multiplier), Timeframe2Multiplier);
+			storage.SetValue(nameof(Timeframe3Multiplier), Timeframe3Multiplier);
+			storage.SetValue(nameof(FontColor), FontColor?.ToArgb());
+			storage.SetValue(nameof(Timeframe2Color), Timeframe2Color?.ToArgb());
+			storage.SetValue(nameof(Timeframe2FrameColor), Timeframe2FrameColor?.ToArgb());
+			storage.SetValue(nameof(Timeframe3Color), Timeframe3Color?.ToArgb());
+			storage.SetValue(nameof(MaxVolumeColor), MaxVolumeColor?.ToArgb());
+			storage.SetValue(nameof(ClusterSeparatorLineColor), ClusterSeparatorLineColor?.ToArgb());
+			storage.SetValue(nameof(ClusterLineColor), ClusterLineColor?.ToArgb());
+			storage.SetValue(nameof(ClusterTextColor), ClusterTextColor?.ToArgb());
+			storage.SetValue(nameof(ClusterColor), ClusterColor?.ToArgb());
+			storage.SetValue(nameof(ClusterMaxColor), ClusterMaxColor?.ToArgb());
+			storage.SetValue(nameof(ShowHorizontalVolumes), ShowHorizontalVolumes);
+			storage.SetValue(nameof(LocalHorizontalVolumes), LocalHorizontalVolumes);
+			storage.SetValue(nameof(HorizontalVolumeWidthFraction), HorizontalVolumeWidthFraction);
+			storage.SetValue(nameof(HorizontalVolumeColor), HorizontalVolumeColor?.ToArgb());
+			storage.SetValue(nameof(HorizontalVolumeFontColor), HorizontalVolumeFontColor?.ToArgb());
+			storage.SetValue(nameof(PriceStep), PriceStep);
+			storage.SetValue(nameof(DrawSeparateVolumes), DrawSeparateVolumes);
+			storage.SetValue(nameof(BuyColor), BuyColor?.ToArgb());
+			storage.SetValue(nameof(SellColor), SellColor?.ToArgb());
+		}
 	}
 
 	private class DummyTransactionElement : DummyElement, IChartTransactionElement
@@ -354,6 +447,18 @@ public class DummyChartBuilder : IChartBuilder
 
 			UseAltIcon = storage.GetValue<bool>(nameof(UseAltIcon));
 			DrawSize = storage.GetValue<double>(nameof(DrawSize));
+		}
+
+		public override void Save(SettingsStorage storage)
+		{
+			base.Save(storage);
+
+			storage.SetValue(nameof(BuyColor), BuyColor.ToArgb());
+			storage.SetValue(nameof(BuyStrokeColor), BuyStrokeColor.ToArgb());
+			storage.SetValue(nameof(SellColor), SellColor.ToArgb());
+			storage.SetValue(nameof(SellStrokeColor), SellStrokeColor.ToArgb());
+			storage.SetValue(nameof(UseAltIcon), UseAltIcon);
+			storage.SetValue(nameof(DrawSize), DrawSize);
 		}
 	}
 
