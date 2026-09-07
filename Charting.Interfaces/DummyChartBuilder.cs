@@ -34,6 +34,13 @@ public class DummyChartBuilder : IChartBuilder
 
 			Id = storage.GetValue<Guid>(nameof(Id));
 		}
+
+		public override void Save(SettingsStorage storage)
+		{
+			base.Save(storage);
+
+			storage.SetValue(nameof(Id), Id);
+		}
 	}
 
 	private class DummyElement : DummyPart<IChartElement>, IChartElement
@@ -160,7 +167,10 @@ public class DummyChartBuilder : IChartBuilder
 		public string TextFormatting { get; set; }
 		public string CursorTextFormatting { get; set; }
 		public string SubDayTextFormatting { get; set; }
-		public TimeZoneInfo TimeZone { get; set; }
+		// A schema is read and written on whatever machine happens to open it, so an axis that states no
+		// zone means UTC rather than that machine's: a local default travels into the file and the schema
+		// comes back showing a different hour than the one it was drawn in.
+		public TimeZoneInfo TimeZone { get; set; } = TimeZoneInfo.Utc;
 
 		void INotifyPropertyChangedEx.NotifyPropertyChanged(string propertyName)
 			=> throw new NotSupportedException();
@@ -186,7 +196,7 @@ public class DummyChartBuilder : IChartBuilder
 			SubDayTextFormatting = storage.GetValue(nameof(SubDayTextFormatting), SubDayTextFormatting);
 			SwitchAxisLocation = storage.GetValue<bool>(nameof(SwitchAxisLocation));
 			AxisType = storage.GetValue<ChartAxisType>(nameof(AxisType));
-			TimeZone = storage.GetValue<string>(nameof(TimeZone)).To<TimeZoneInfo>() ?? TimeZoneInfo.Local;
+			TimeZone = storage.GetValue<string>(nameof(TimeZone)).To<TimeZoneInfo>() ?? TimeZoneInfo.Utc;
 			this.ValidateManualRange();
 		}
 
