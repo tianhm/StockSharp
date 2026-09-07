@@ -98,6 +98,70 @@ public class AlertNotificationRouterTests
 		return new(10, external, sound, popup, log);
 	}
 
+	[TestMethod]
+	public async Task Popup_CarriesTheIconItsLevelDeserves()
+	{
+		// A popup that always looks like a warning tells the user nothing about which alert fired.
+		foreach (var (level, expected) in new[]
+		{
+			(LogLevels.Info, "Info"),
+			(LogLevels.Warning, "Warning"),
+			(LogLevels.Error, "Error"),
+			(LogLevels.Debug, "Debug"),
+		})
+		{
+			var popup = new CountingPopup();
+			using var router = Create(new CountingExternal(), new CountingSound(), popup, out _);
+
+			await ((IAlertNotificationService)router).NotifyAsync(
+				AlertNotifications.Popup, null, level, "caption", "message", DateTime.UtcNow, default);
+
+			popup.LastIconKey.AssertEqual(expected);
+		}
+	}
+
+	[TestMethod]
+	public async Task Log_AndPopup_ShowTheTimeTheUserConfigured()
+	{
+		var original = AppTime.TimeZone;
+
+		try
+		{
+			// A person reading an alert wants the time on their own clock, not on UTC.
+			AppTime.TimeZone = TimeZoneInfo.CreateCustomTimeZone("alerts-test", TimeSpan.FromHours(5), "alerts", "alerts");
+
+			var popup = new CountingPopup();
+			using var router = Create(new CountingExternal(), new CountingSound(), popup, out var log);
+			var time = new DateTime(2026, 1, 1, 10, 0, 0, DateTimeKind.Utc);
+
+			await ((IAlertNotificationService)router).NotifyAsync(
+				AlertNotifications.Log, null, LogLevels.Warning, "caption", "message", time, default);
+
+			await log.Written.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+			// The message carries whatever the current culture formats, so the moment is checked
+			// rather than the text: five hours east of UTC 10:00 is 15:00 the same day.
+			log.LastMessage.Contains(time.ToAppTime().ToString()).AssertTrue(log.LastMessage);
+			time.ToAppTime().Hour.AssertEqual(15);
+		}
+		finally
+		{
+			AppTime.TimeZone = original;
+		}
+	}
+
+	[TestMethod]
+	public async Task Popup_SaysNothingAboutALevelItDoesNotKnow()
+	{
+		var popup = new CountingPopup();
+		using var router = Create(new CountingExternal(), new CountingSound(), popup, out _);
+
+		await ((IAlertNotificationService)router).NotifyAsync(
+			AlertNotifications.Popup, null, LogLevels.Verbose, "caption", "message", DateTime.UtcNow, default);
+
+		popup.LastIconKey.IsEmpty().AssertTrue();
+	}
+
 	private static ValueTask Notify(IAlertNotificationService router, AlertNotifications type)
 		=> router.NotifyAsync(type, null, LogLevels.Warning, "caption", "message", DateTime.UtcNow, default);
 
@@ -121,9 +185,12 @@ public class AlertNotificationRouterTests
 
 		public bool Result { get; init; }
 
+		public string LastIconKey { get; private set; }
+
 		ValueTask<bool> IDesktopPopupService.NotifyAsync(DateTime time, string caption, string message, string iconKey, CancellationToken cancellationToken)
 		{
 			Interlocked.Increment(ref Count);
+			LastIconKey = iconKey;
 			return new(Result);
 		}
 	}
@@ -148,11 +215,14 @@ public class AlertNotificationRouterTests
 
 		public TaskCompletionSource Written { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+		public string LastMessage { get; private set; }
+
 		protected override void RaiseLog(LogMessage message)
 		{
 			if (message.Level == LogLevels.Warning)
 			{
 				Interlocked.Increment(ref Warnings);
+				LastMessage = message.Message;
 				Written.TrySetResult();
 			}
 
