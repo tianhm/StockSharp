@@ -599,6 +599,122 @@ public class AdapterWrapperPipelineBuilderTests : BaseTestClass
 		IsTrue(HasWrapper<ExtendedInfoStorageMessageAdapter>(result));
 	}
 
+	[TestMethod]
+	public void ExtendedInfoStorageAdapter_RefusesAdapterWithoutStorageName()
+	{
+		var inner = new Mock<IMessageAdapter>();
+		var extStorage = new Mock<IExtendedInfoStorage>();
+
+		// The storage is keyed by the adapter's StorageName, so an adapter that has none cannot be
+		// wrapped: it would either overwrite an unrelated storage or create a nameless one.
+		ThrowsExactly<ArgumentException>(() => { new ExtendedInfoStorageMessageAdapter(inner.Object, extStorage.Object); });
+	}
+
+	[TestMethod]
+	public void ExtendedInfoStorageAdapter_RefusesNullStorage()
+	{
+		var inner = new TestPipelineAdapter { ExtendedFields = [("Field1", typeof(string))] };
+
+		ThrowsExactly<ArgumentNullException>(() => { new ExtendedInfoStorageMessageAdapter(inner, null); });
+	}
+
+	[TestMethod]
+	public async Task ExtendedInfoStorageAdapter_ForwardsOutMessagesUnchanged()
+	{
+		var inner = new TestPipelineAdapter { ExtendedFields = [("Field1", typeof(string))] };
+		var extStorage = new Mock<IExtendedInfoStorage>();
+
+		using var adapter = new ExtendedInfoStorageMessageAdapter(inner, extStorage.Object);
+
+		var output = new List<Message>();
+		adapter.NewOutMessageAsync += (m, ct) => { output.Add(m); return default; };
+
+		var secMsg = new SecurityMessage { SecurityId = Helper.CreateSecurityId() };
+
+		await inner.SendOutMessageAsync(secMsg, CancellationToken);
+
+		// Whatever the wrapper records on the side, it is transparent on the way out: the consumer of
+		// the pipeline gets the message the underlying adapter produced, not a copy and not a filtered one.
+		output.Count.AssertEqual(1);
+		AreSame(secMsg, output[0]);
+	}
+
+	// Keeps what it is handed, so a test can ask what actually reached the storage.
+	private sealed class RecordingExtendedInfoStorage : IExtendedInfoStorage
+	{
+		private sealed class Item(string storageName, IEnumerable<(string name, Type type)> fields) : IExtendedInfoStorageItem
+		{
+			private readonly Dictionary<SecurityId, IDictionary<string, object>> _values = [];
+
+			public IEnumerable<(string name, Type type)> Fields { get; } = [.. fields];
+
+			public IEnumerable<SecurityId> Securities => [.. _values.Keys];
+
+			public string StorageName { get; } = storageName;
+
+			public ValueTask InitAsync(CancellationToken cancellationToken) => default;
+
+			public void Add(SecurityId securityId, IDictionary<string, object> extensionInfo)
+				=> _values[securityId] = extensionInfo;
+
+			public IEnumerable<(SecurityId secId, IDictionary<string, object> fields)> Load()
+				=> [.. _values.Select(p => (p.Key, p.Value))];
+
+			public IDictionary<string, object> Load(SecurityId securityId)
+				=> _values.TryGetValue(securityId);
+
+			public void Delete(SecurityId securityId) => _values.Remove(securityId);
+		}
+
+		private readonly Dictionary<string, Item> _items = new(StringComparer.InvariantCultureIgnoreCase);
+
+		public IEnumerable<IExtendedInfoStorageItem> Storages => [.. _items.Values];
+
+		public ValueTask<Dictionary<IExtendedInfoStorageItem, Exception>> InitAsync(CancellationToken cancellationToken)
+			=> new(new Dictionary<IExtendedInfoStorageItem, Exception>());
+
+		public ValueTask<IExtendedInfoStorageItem> GetAsync(string storageName, CancellationToken cancellationToken)
+			=> new(_items.TryGetValue(storageName));
+
+		public ValueTask<IExtendedInfoStorageItem> CreateAsync(string storageName, IEnumerable<(string name, Type type)> fields, CancellationToken cancellationToken)
+			=> new(_items.SafeAdd(storageName, key => new Item(key, fields)));
+
+		public ValueTask DeleteAsync(IExtendedInfoStorageItem storage, CancellationToken cancellationToken)
+		{
+			_items.Remove(storage.StorageName);
+			return default;
+		}
+
+		public event Action<IExtendedInfoStorageItem> Created { add { } remove { } }
+		public event Action<IExtendedInfoStorageItem> Deleted { add { } remove { } }
+	}
+
+	/// <summary>
+	/// The wrapper is put into the pipeline for one reason: to keep the extended security fields the
+	/// adapter declares. If it keeps nothing, the storage stays empty while every setting says the data
+	/// is being collected, and the user finds out only when the data is wanted and is not there.
+	/// </summary>
+	[TestMethod]
+	public async Task ExtendedSecurityInfoReachesTheExtendedInfoStorage()
+	{
+		var inner = new TestPipelineAdapter { ExtendedFields = [("Field1", typeof(string))] };
+		var extStorage = new RecordingExtendedInfoStorage();
+
+		using var adapter = new ExtendedInfoStorageMessageAdapter(inner, extStorage);
+
+		var output = new List<Message>();
+		adapter.NewOutMessageAsync += (m, ct) => { output.Add(m); return default; };
+
+		var secId = Helper.CreateSecurityId();
+
+		await inner.SendOutMessageAsync(new SecurityMessage { SecurityId = secId }, CancellationToken);
+
+		var item = await extStorage.GetAsync(inner.StorageName, CancellationToken);
+
+		item.AssertNotNull("the wrapper has to keep a storage named after the adapter it wraps");
+		item.Securities.AssertContains(secId, "the security that came out of the adapter has to be in the storage");
+	}
+
 	#endregion
 
 	#region Previously Uncovered Branches

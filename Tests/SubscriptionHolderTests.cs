@@ -806,5 +806,52 @@ public class SubscriptionHolderTests : BaseTestClass
 		matched[0].Id.AssertEqual(600);
 	}
 
+	[TestMethod]
+	public void GetSubscriptions_TransactionsExecution_OrderIdIndex_StaysWithinMaxTrackedItems()
+	{
+		// Every order seen on a transactional subscription adds an owner entry, and MaxTrackedItems
+		// is what bounds the holder's helper tracking - a session that lives for days must not
+		// accumulate one entry per order it ever sent.
+		const int limit = 10;
+		const int orders = 200;
+		const long firstOrderId = 100000L;
+
+		using var holder = CreateHolder();
+		holder.MaxTrackedItems = limit;
+
+		holder.Add(CreateOrderStatusSub(700, "sessionA", SubscriptionStates.Online));
+		holder.Add(CreateOrderStatusSub(701, "sessionB", SubscriptionStates.Online));
+
+		for (var i = 0; i < orders; i++)
+		{
+			holder.GetSubscriptions(new ExecutionMessage
+			{
+				DataTypeEx = DataType.Transactions,
+				OriginalTransactionId = 700,
+				TransactionId = firstOrderId + i,
+				OrderState = OrderStates.Done,
+			}).Count().AssertEqual(1);
+		}
+
+		// An order id the index still remembers routes to its owner alone; a forgotten one falls
+		// back to every online transactional subscription. Counting the first kind counts the index.
+		var retained = 0;
+
+		for (var i = 0; i < orders; i++)
+		{
+			var matched = holder.GetSubscriptions(new ExecutionMessage
+			{
+				DataTypeEx = DataType.Transactions,
+				OriginalTransactionId = firstOrderId + i,
+				TradeId = 1,
+			}).ToArray();
+
+			if (matched.Length == 1 && matched[0].Id == 700)
+				retained++;
+		}
+
+		(retained <= limit).AssertTrue($"the order-id index kept {retained} entries with MaxTrackedItems={limit}");
+	}
+
 	#endregion
 }

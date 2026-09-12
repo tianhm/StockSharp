@@ -7,8 +7,13 @@ public class SubscriptionOnlineManagerTests : BaseTestClass
 	{
 	}
 
+	/// <summary>
+	/// A subscriber joining a stream that is not itself online yet is acknowledged at once, but goes
+	/// online with the stream, not before it: until the venue has confirmed the shared subscription
+	/// it may still be refused, and "online" followed by an error is not a sequence a caller can act on.
+	/// </summary>
 	[TestMethod]
-	public async Task Subscribe_SecondSubscription_JoinsAndReturnsResponseAndOnline()
+	public async Task Subscribe_SecondSubscription_JoinsAndGoesOnlineWithTheStream()
 	{
 		var logReceiver = new TestReceiver();
 		var manager = new SubscriptionOnlineManager(logReceiver, _ => true, new SubscriptionOnlineManagerState());
@@ -39,10 +44,17 @@ public class SubscriptionOnlineManagerTests : BaseTestClass
 
 		var secondResult = await manager.ProcessInMessageAsync(second, token);
 		secondResult.toInner.Length.AssertEqual(0);
-		secondResult.toOut.Length.AssertEqual(2);
 
 		secondResult.toOut.OfType<SubscriptionResponseMessage>().Single().OriginalTransactionId.AssertEqual(2);
-		secondResult.toOut.OfType<SubscriptionOnlineMessage>().Single().OriginalTransactionId.AssertEqual(2);
+		secondResult.toOut.OfType<SubscriptionOnlineMessage>().Count(m => m.OriginalTransactionId == 2)
+			.AssertEqual(0, "the stream it joined has not been confirmed yet, so neither is it online");
+
+		await manager.ProcessOutMessageAsync(new SubscriptionResponseMessage { OriginalTransactionId = 1 }, token);
+
+		var (_, extraOut) = await manager.ProcessOutMessageAsync(new SubscriptionOnlineMessage { OriginalTransactionId = 1 }, token);
+
+		extraOut.OfType<SubscriptionOnlineMessage>().Count(m => m.OriginalTransactionId == 2)
+			.AssertEqual(1, "the joined subscriber goes online when the stream does");
 	}
 
 	[TestMethod]
@@ -572,6 +584,43 @@ public class SubscriptionOnlineManagerTests : BaseTestClass
 		// The error must answer the unsubscribe request itself (TransactionId = 100),
 		// not the non-existent subscription id (999) — otherwise the Connector cannot match it.
 		response.OriginalTransactionId.AssertEqual(100);
+	}
+
+	/// <summary>
+	/// The only holder of a stream gives it up before the venue has confirmed it. Answering the
+	/// caller here or passing the unsubscribe on are both defensible; doing neither leaves the
+	/// caller with an unanswered request and the venue still sending a stream nobody holds.
+	/// </summary>
+	[TestMethod]
+	public async Task UnsubscribeLastSubscriber_BeforeConfirmation_IsNotDropped()
+	{
+		var logReceiver = new TestReceiver();
+		var manager = new SubscriptionOnlineManager(logReceiver, _ => true, new SubscriptionOnlineManagerState());
+		var token = CancellationToken;
+
+		var secId = Helper.CreateSecurityId();
+
+		var (toInner1, _) = await manager.ProcessInMessageAsync(new MarketDataMessage
+		{
+			IsSubscribe = true,
+			TransactionId = 1,
+			SecurityId = secId,
+			DataType2 = DataType.Ticks,
+		}, token);
+
+		toInner1.Length.AssertEqual(1, "the stream was opened upstream");
+		// no response from the venue yet
+
+		var (toInner2, toOut2) = await manager.ProcessInMessageAsync(new MarketDataMessage
+		{
+			IsSubscribe = false,
+			TransactionId = 2,
+			OriginalTransactionId = 1,
+			SecurityId = secId,
+			DataType2 = DataType.Ticks,
+		}, token);
+
+		IsTrue(toInner2.Length + toOut2.Length > 0, "an unsubscribe of the last holder must be passed on or answered, not swallowed");
 	}
 
 	#endregion
@@ -1420,6 +1469,108 @@ public class SubscriptionOnlineManagerTests : BaseTestClass
 		IsTrue(allMessages.Count > 0,
 			"SubscriptionFinished for hist+live subscription should not be silently swallowed — " +
 			"subscriber needs notification to transition to live");
+	}
+
+	/// <summary>
+	/// The mirror of the hist+live child case: here the shared subscription is the one replaying
+	/// history and a live-only subscriber joins it. Online means the stream has caught up, so a
+	/// subscriber cannot be told it while the stream it joined is still in its history phase; it is
+	/// told when the stream is, by the same promotion that serves every other joiner.
+	/// </summary>
+	[TestMethod]
+	public async Task JoinedLiveSubscriber_GoesOnlineOnlyWhenMainHistoryIsDone()
+	{
+		var logReceiver = new TestReceiver();
+		var manager = new SubscriptionOnlineManager(logReceiver, _ => true, new SubscriptionOnlineManagerState());
+		var token = CancellationToken;
+
+		var secId = Helper.CreateSecurityId();
+
+		// Main subscription — hist+live (From set, To null): it replays history, then goes live
+		await manager.ProcessInMessageAsync(new MarketDataMessage
+		{
+			IsSubscribe = true,
+			TransactionId = 100,
+			SecurityId = secId,
+			DataType2 = DataType.Ticks,
+			From = new DateTime(2023, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+		}, token);
+
+		await manager.ProcessOutMessageAsync(new SubscriptionResponseMessage { OriginalTransactionId = 100 }, token);
+		// no SubscriptionOnline yet — the venue is still replaying history
+
+		// Live-only subscriber joins the same key
+		var (toInner2, toOut2) = await manager.ProcessInMessageAsync(new MarketDataMessage
+		{
+			IsSubscribe = true,
+			TransactionId = 101,
+			SecurityId = secId,
+			DataType2 = DataType.Ticks,
+		}, token);
+
+		toInner2.Length.AssertEqual(0, "the joiner reuses the stream that is already open");
+		toOut2.OfType<SubscriptionResponseMessage>().Count(m => m.OriginalTransactionId == 101)
+			.AssertEqual(1, "its request is acknowledged at once");
+		toOut2.OfType<SubscriptionOnlineMessage>().Count(m => m.OriginalTransactionId == 101)
+			.AssertEqual(0, "but the stream it joined is still replaying history, so it is not online");
+
+		var (_, extraOut) = await manager.ProcessOutMessageAsync(new SubscriptionOnlineMessage { OriginalTransactionId = 100 }, token);
+
+		extraOut.OfType<SubscriptionOnlineMessage>().Count(m => m.OriginalTransactionId == 101)
+			.AssertEqual(1, "history is done and the stream is live, so the joiner is online too");
+	}
+
+	/// <summary>
+	/// History belongs to whoever asked for it. A subscriber that asked for live data only must not
+	/// be handed trades from before it subscribed just because the stream it joined happens to be
+	/// replaying them.
+	/// </summary>
+	[TestMethod]
+	public async Task JoinedLiveSubscriber_DoesNotReceiveMainHistory()
+	{
+		var logReceiver = new TestReceiver();
+		var manager = new SubscriptionOnlineManager(logReceiver, _ => true, new SubscriptionOnlineManagerState());
+		var token = CancellationToken;
+
+		var secId = Helper.CreateSecurityId();
+
+		await manager.ProcessInMessageAsync(new MarketDataMessage
+		{
+			IsSubscribe = true,
+			TransactionId = 100,
+			SecurityId = secId,
+			DataType2 = DataType.Ticks,
+			From = new DateTime(2023, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+		}, token);
+
+		await manager.ProcessOutMessageAsync(new SubscriptionResponseMessage { OriginalTransactionId = 100 }, token);
+
+		await manager.ProcessInMessageAsync(new MarketDataMessage
+		{
+			IsSubscribe = true,
+			TransactionId = 101,
+			SecurityId = secId,
+			DataType2 = DataType.Ticks,
+		}, token);
+
+		// A trade from the main subscription's history phase — years before the joiner asked for anything
+		var histTick = new ExecutionMessage
+		{
+			SecurityId = secId,
+			ServerTime = new DateTime(2023, 1, 2, 12, 0, 0, DateTimeKind.Utc),
+			DataTypeEx = DataType.Ticks,
+			TradePrice = 100m,
+			TradeVolume = 1m,
+			OriginalTransactionId = 100,
+		};
+
+		var (forward, _) = await manager.ProcessOutMessageAsync(histTick, token);
+
+		forward.AssertNotNull("the subscriber that asked for the history still gets it");
+
+		var ids = ((ISubscriptionIdMessage)forward).GetSubscriptionIds();
+		ids.Count(id => id == 100).AssertEqual(1, "history goes to the subscriber that requested it");
+		ids.Count(id => id == 101).AssertEqual(0, "a live-only subscriber must not be handed another subscription's backfill");
 	}
 
 	#endregion

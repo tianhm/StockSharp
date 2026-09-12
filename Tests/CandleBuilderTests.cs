@@ -531,6 +531,108 @@ public class CandleBuilderTests : BaseTestClass
 	}
 
 	/// <summary>
+	/// A gap is ordinary market data: a halt that reopens far away, a fat-fingered print, a feed
+	/// that momentarily quotes another instrument. Whatever the number is, it is one tick, and the
+	/// builder has to keep serving the subscription after it. An exception thrown out of the
+	/// builder takes down the whole candle stream - every chart and every strategy fed by it -
+	/// and names none of the prices that caused it.
+	/// </summary>
+	[TestMethod]
+	public void RenkoCandleBuilder_APriceGapTooWideToCountInBoxesLeavesTheStreamRunning()
+	{
+		var provider = new MockExchangeInfoProvider();
+		var builder = new RenkoCandleBuilder(provider);
+
+		var subscription = new MockCandleBuilderSubscription
+		{
+			Message = new MarketDataMessage
+			{
+				SecurityId = CreateSecurityId(),
+				DataType2 = DataType.Create<RenkoCandleMessage>(new Unit(0.01m)),
+			}
+		};
+
+		var baseTime = new DateTime(2024, 1, 1, 10, 0, 0).UtcKind();
+
+		foreach (var _ in builder.Process(subscription, new MockTransform { Price = 100m, Volume = 1m, Time = baseTime }))
+		{
+		}
+
+		// 30 000 000 sits 2 999 990 000 boxes of 0.01 above 100 - more boxes than an int can count.
+		var gap = new MockTransform { Price = 30_000_000m, Volume = 1m, Time = baseTime.AddSeconds(1) };
+
+		const int brickLimit = 10_000;
+
+		var produced = 0;
+		Exception error = null;
+
+		try
+		{
+			// Enumerated lazily and cut short, so a builder that means to draw billions of bricks
+			// is reported as unbounded instead of hanging the run.
+			foreach (var _ in builder.Process(subscription, gap))
+			{
+				if (++produced > brickLimit)
+					break;
+			}
+		}
+		catch (Exception ex)
+		{
+			error = ex;
+		}
+
+		error.AssertNull();
+
+		IsLessOrEqual(produced, brickLimit, "one gapped tick must not be answered with an unbounded run of bricks");
+	}
+
+	/// <summary>
+	/// One tick is one number, and the subscriber is holding every candle it is handed. A move
+	/// that is worth a hundred million boxes says the price is broken, not that the user wants a
+	/// hundred million bricks drawn: that is minutes of one thread and gigabytes of messages for
+	/// a chart nobody can read. The builder must bound what a single tick can cost.
+	/// </summary>
+	[TestMethod]
+	public void RenkoCandleBuilder_OneTickNeverTurnsIntoAnUnboundedRunOfBricks()
+	{
+		var provider = new MockExchangeInfoProvider();
+		var builder = new RenkoCandleBuilder(provider);
+
+		var subscription = new MockCandleBuilderSubscription
+		{
+			Message = new MarketDataMessage
+			{
+				SecurityId = CreateSecurityId(),
+				DataType2 = DataType.Create<RenkoCandleMessage>(new Unit(0.01m)),
+			}
+		};
+
+		var baseTime = new DateTime(2024, 1, 1, 10, 0, 0).UtcKind();
+
+		foreach (var _ in builder.Process(subscription, new MockTransform { Price = 100m, Volume = 1m, Time = baseTime }))
+		{
+		}
+
+		// 1 000 100 is 100 000 000 boxes of 0.01 above 100: a count an int holds comfortably, so
+		// nothing stops the builder from materializing a brick for every one of them.
+		var gap = new MockTransform { Price = 1_000_100m, Volume = 1m, Time = baseTime.AddSeconds(1) };
+
+		const int brickLimit = 100_000;
+
+		var produced = 0;
+
+		// Lazy enumeration cut short at the cap: what is measured is how many bricks the builder
+		// is willing to hand over for a single tick, not how long it takes to hand them over.
+		foreach (var _ in builder.Process(subscription, gap))
+		{
+			if (++produced > brickLimit)
+				break;
+		}
+
+		IsLessOrEqual(produced, brickLimit, "the bricks one tick may produce must be capped");
+	}
+
+	/// <summary>
 	/// RenkoCandleBuilder: small price movements don't create new bricks.
 	/// </summary>
 	[TestMethod]
@@ -733,6 +835,56 @@ public class CandleBuilderTests : BaseTestClass
 		(currentCandle.OpenPrice >= currentCandle.ClosePrice).AssertTrue("O column: Open >= Close");
 		AreEqual(15m, currentCandle.TotalVolume, "Current candle TotalVolume should be 15");
 		AreEqual(1, currentCandle.TotalTicks, "Current candle TotalTicks should be 1");
+	}
+
+	/// <summary>
+	/// A P&amp;F box is timestamped like any other candle: a reader is entitled to take
+	/// <see cref="CandleMessage.CloseTime"/> as the moment the box last moved, even on a box that has
+	/// only just been opened. Without it a freshly created box would leave that time empty, and
+	/// anything that orders, charts or stores candles by their close would put the newest box in 1
+	/// January 0001.
+	/// </summary>
+	[TestMethod]
+	public void PnFCandleBuilder_NewBox_CarriesACloseTime()
+	{
+		var provider = new MockExchangeInfoProvider();
+		var builder = new PnFCandleBuilder(provider);
+
+		var subscription = new MockCandleBuilderSubscription
+		{
+			Message = new MarketDataMessage
+			{
+				SecurityId = CreateSecurityId(),
+				DataType2 = DataType.Create<PnFCandleMessage>(new PnFArg { BoxSize = new Unit(1m), ReversalAmount = 3 }),
+			}
+		};
+
+		var baseTime = new DateTime(2025, 3, 4, 10, 0, 0, DateTimeKind.Utc);
+
+		// The very first value opens the first box.
+		builder.Process(subscription, new MockTransform { Price = 100m, Volume = 10, Time = baseTime }).ToArray();
+
+		var firstBox = (PnFCandleMessage)subscription.CurrentCandle;
+		IsNotNull(firstBox);
+		AreEqual(baseTime, firstBox.OpenTime, "the box opens at the time of the value that created it");
+		AreEqual(baseTime, firstBox.CloseTime, "a box that has only just been opened closes at that same time, not at an empty one");
+
+		// The box goes on rising, so it keeps the time of the value that last moved it.
+		builder.Process(subscription, new MockTransform { Price = 105m, Volume = 20, Time = baseTime.AddSeconds(1) }).ToArray();
+
+		AreEqual(baseTime.AddSeconds(1), firstBox.CloseTime, "a box that moved again closes at the time of the value that moved it");
+
+		// A drop of more than the reversal amount finishes that box and opens a new one in the
+		// opposite direction - the case where the new box is created rather than updated.
+		builder.Process(subscription, new MockTransform { Price = 101m, Volume = 15, Time = baseTime.AddSeconds(2) }).ToArray();
+
+		var reversalBox = (PnFCandleMessage)subscription.CurrentCandle;
+		AreNotSame(firstBox, reversalBox, "the reversal opens a new box rather than going on with the old one");
+		AreEqual(CandleStates.Finished, firstBox.State, "the box the reversal left behind is finished");
+		AreEqual(baseTime.AddSeconds(1), firstBox.CloseTime, "the finished box keeps the time it last moved, not the time of the reversal");
+
+		AreEqual(baseTime.AddSeconds(2), reversalBox.OpenTime, "the new box opens at the time of the value that reversed the column");
+		AreEqual(baseTime.AddSeconds(2), reversalBox.CloseTime, "and closes at that same time while it holds only that one value");
 	}
 
 	#endregion
@@ -972,8 +1124,15 @@ public class CandleBuilderTests : BaseTestClass
 		var earlyTime = new DateTime(2024, 1, 1, 9, 58, 0).UtcKind();
 		var result = builder.Process(subscription, new MockTransform { Price = 50m, Volume = 10, Time = earlyTime }).ToList();
 
-		// Should create new candle for 9:55-10:00 period or be handled appropriately
-		// The exact behavior depends on implementation
+		// A tick belonging to an already passed period cannot close the period being built:
+		// whatever is done with the stale tick, the 10:00 candle stays open and untouched by it.
+		result.Any(c => c.OpenTime == new DateTime(2024, 1, 1, 10, 0, 0).UtcKind())
+			.AssertFalse("the current period must not be finished by a tick from the past");
+
+		var current = subscription.CurrentCandle as TimeFrameCandleMessage;
+		IsNotNull(current);
+		AreEqual(new DateTime(2024, 1, 1, 10, 0, 0).UtcKind(), current.OpenTime, "the candle being built must not move back in time");
+		AreEqual(100m, current.ClosePrice, "a tick from a passed period is not the close of the current one");
 	}
 
 	/// <summary>
@@ -1017,6 +1176,117 @@ public class CandleBuilderTests : BaseTestClass
 		AreEqual(95m, candle.LowPrice, "Low should be min price");
 		AreEqual(102m, candle.ClosePrice, "Close should be last price");
 		AreEqual(4, candle.TotalTicks, "Should have 4 ticks");
+	}
+
+	/// <summary>
+	/// TimeFrameCandleBuilder: a tick from a passed period does not make the current period be delivered twice.
+	/// </summary>
+	[TestMethod]
+	public void TimeFrameCandleBuilder_PastTick_DoesNotEmitPeriodTwice()
+	{
+		// A period is closed once and carries every tick that belongs to it; a stale tick arriving
+		// in the middle must not close 10:00 early and let the next tick open 10:00 again.
+		var provider = new MockExchangeInfoProvider();
+		var builder = new TimeFrameCandleBuilder(provider);
+
+		var subscription = new MockCandleBuilderSubscription
+		{
+			Message = new MarketDataMessage
+			{
+				SecurityId = CreateSecurityId(),
+				DataType2 = TimeSpan.FromMinutes(1).TimeFrame(),
+			}
+		};
+
+		var emitted = new List<CandleMessage>();
+
+		void process(decimal price, DateTime time)
+		{
+			// the builder yields the same instance again and again, so keep a copy of each state
+			foreach (var c in builder.Process(subscription, new MockTransform { Price = price, Volume = 10, Time = time }))
+				emitted.Add(c.TypedClone());
+		}
+
+		var open = new DateTime(2024, 1, 1, 10, 0, 0).UtcKind();
+
+		process(100m, open.AddSeconds(30));
+		process(50m, open.AddSeconds(-30));  // tick from the previous period, out of order
+		process(101m, open.AddSeconds(45));
+		process(102m, open.AddMinutes(1).AddSeconds(10));
+
+		var finished10 = emitted
+			.Where(c => c.State == CandleStates.Finished && c.OpenTime == open)
+			.ToList();
+
+		AreEqual(1, finished10.Count, "the 10:00 period must be finished exactly once");
+		AreEqual(100m, finished10[0].OpenPrice, "Open is the first tick of the period");
+		AreEqual(101m, finished10[0].ClosePrice, "Close is the last tick of the period");
+		AreEqual(2, finished10[0].TotalTicks, "both 10:00 ticks belong to the same candle");
+	}
+
+	/// <summary>
+	/// TimeFrameCandleBuilder: <see cref="TimeFrameCandleBuilder.GenerateEmptyCandles"/> produces the periods without trades.
+	/// </summary>
+	[TestMethod]
+	public void TimeFrameCandleBuilder_GenerateEmptyCandles_FillsSkippedPeriods()
+	{
+		// GenerateEmptyCandles is on by default and promises candles for periods with no trades,
+		// so a gap between two ticks must still deliver the periods in between.
+		var provider = new MockExchangeInfoProvider();
+		var builder = new TimeFrameCandleBuilder(provider);
+
+		builder.GenerateEmptyCandles.AssertTrue("empty candles are generated by default");
+
+		var subscription = new MockCandleBuilderSubscription
+		{
+			Message = new MarketDataMessage
+			{
+				SecurityId = CreateSecurityId(),
+				DataType2 = TimeSpan.FromMinutes(1).TimeFrame(),
+			}
+		};
+
+		var open = new DateTime(2024, 1, 1, 10, 0, 0).UtcKind();
+		var emitted = new List<CandleMessage>();
+
+		emitted.AddRange(builder.Process(subscription, new MockTransform { Price = 100m, Volume = 10, Time = open.AddSeconds(10) }).Select(c => c.TypedClone()));
+		emitted.AddRange(builder.Process(subscription, new MockTransform { Price = 101m, Volume = 10, Time = open.AddMinutes(3).AddSeconds(10) }).Select(c => c.TypedClone()));
+
+		var openTimes = emitted.Select(c => c.OpenTime).Distinct().ToList();
+
+		openTimes.Contains(open.AddMinutes(1)).AssertTrue("the 10:01 period had no trades and must be delivered as an empty candle");
+		openTimes.Contains(open.AddMinutes(2)).AssertTrue("the 10:02 period had no trades and must be delivered as an empty candle");
+	}
+
+	/// <summary>
+	/// TimeFrameCandleBuilder: with <see cref="TimeFrameCandleBuilder.GenerateEmptyCandles"/> off the periods without trades are skipped.
+	/// </summary>
+	[TestMethod]
+	public void TimeFrameCandleBuilder_GenerateEmptyCandles_Disabled_SkipsPeriods()
+	{
+		// The other half of the same setting: turned off, nothing is invented for periods without trades.
+		var provider = new MockExchangeInfoProvider();
+		var builder = new TimeFrameCandleBuilder(provider) { GenerateEmptyCandles = false };
+
+		var subscription = new MockCandleBuilderSubscription
+		{
+			Message = new MarketDataMessage
+			{
+				SecurityId = CreateSecurityId(),
+				DataType2 = TimeSpan.FromMinutes(1).TimeFrame(),
+			}
+		};
+
+		var open = new DateTime(2024, 1, 1, 10, 0, 0).UtcKind();
+		var emitted = new List<CandleMessage>();
+
+		emitted.AddRange(builder.Process(subscription, new MockTransform { Price = 100m, Volume = 10, Time = open.AddSeconds(10) }).Select(c => c.TypedClone()));
+		emitted.AddRange(builder.Process(subscription, new MockTransform { Price = 101m, Volume = 10, Time = open.AddMinutes(3).AddSeconds(10) }).Select(c => c.TypedClone()));
+
+		var openTimes = emitted.Select(c => c.OpenTime).Distinct().ToList();
+
+		openTimes.Contains(open.AddMinutes(1)).AssertFalse("nothing must be invented for a period without trades");
+		openTimes.Contains(open.AddMinutes(2)).AssertFalse("nothing must be invented for a period without trades");
 	}
 
 	#endregion

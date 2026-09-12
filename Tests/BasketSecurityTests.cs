@@ -1,5 +1,7 @@
 ﻿namespace StockSharp.Tests;
 
+using Ecng.Compilation;
+
 [TestClass]
 public class BasketSecurityTests : BaseTestClass
 {
@@ -32,6 +34,74 @@ public class BasketSecurityTests : BaseTestClass
 		};
 
 		Do(basket, prices => prices[0] - 10 * prices[1], lkoh, sber);
+	}
+
+	/// <summary>
+	/// Assigning a formula to an index either takes effect or fails loudly. What it must never do is
+	/// leave the index quietly calculating the formula it had before: from then on every value the
+	/// index publishes belongs to a formula the caller believes it replaced, and nothing on the
+	/// object says so.
+	/// </summary>
+	[TestMethod]
+	[DoNotParallelize] // Takes C# out of the process-wide compiler provider for the duration.
+	public void ExpressionIndex_WithoutACompiler_RefusesTheExpressionInsteadOfKeepingTheOld()
+	{
+		var basket = new ExpressionIndexSecurity
+		{
+			Id = "LKOH_SBER_EXP@TQBR",
+			Board = ExchangeBoard.MicexTqbr,
+			Expression = "LKOH@TQBR - 10 * SBER@TQBR",
+		};
+
+		basket.Formula.Error.IsEmpty().AssertTrue("the first formula must compile");
+
+		var previous = basket.Expression;
+
+		var compilers = ConfigManager.TryGetService<CompilerProvider>();
+		compilers.AssertNotNull("the suite registers a compiler provider");
+
+		var csharp = compilers[FileExts.CSharp];
+
+		try
+		{
+			// With C# gone from the provider nothing can turn the new text into a formula.
+			compilers.Remove(FileExts.CSharp);
+
+			basket.Expression = "SBER@TQBR * 2";
+
+			basket.Formula.Error.IsEmpty().AssertFalse("an index that could not compile the formula it was given must report that it cannot calculate");
+			basket.Expression.AssertNotEqual(previous, "the replaced formula must not stay in force");
+		}
+		finally
+		{
+			compilers[FileExts.CSharp] = csharp;
+		}
+	}
+
+	/// <summary>
+	/// A cloned index is the same index: it calculates the same formula over the same legs. A clone
+	/// that came back with a different formula, or with no legs to subscribe to, silently stops
+	/// producing the index the caller cloned.
+	/// </summary>
+	[TestMethod]
+	public void ExpressionIndex_Clone_KeepsTheFormulaAndItsInnerSecurities()
+	{
+		var basket = new ExpressionIndexSecurity
+		{
+			Id = "LKOH_SBER_EXP@TQBR",
+			Board = ExchangeBoard.MicexTqbr,
+			Expression = "LKOH@TQBR - 10 * SBER@TQBR",
+		};
+
+		var inner = basket.InnerSecurityIds.ToArray();
+		inner.Length.AssertEqual(2, "both legs of the formula must be known");
+
+		var clone = (ExpressionIndexSecurity)basket.Clone();
+
+		clone.Expression.AssertEqual(basket.Expression, "a clone calculates the same formula");
+		clone.Formula.Error.IsEmpty().AssertTrue("a clone must be able to calculate");
+		clone.InnerSecurityIds.ToArray().AssertEqual(inner, "a clone subscribes to the same legs");
+		clone.Id.AssertEqual(basket.Id);
 	}
 
 	[TestMethod]

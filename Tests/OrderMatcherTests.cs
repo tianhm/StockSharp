@@ -339,6 +339,67 @@ public class OrderMatcherTests : BaseTestClass
 	}
 
 	[TestMethod]
+	public void Match_MarketFOK_PartialLiquidity_KillsWithoutTouchingTheBook()
+	{
+		var book = CreateBookWithSpread(bid: 100, ask: 101, volume: 3);
+		var matcher = new OrderMatcher();
+
+		var order = new EmulatorOrder
+		{
+			TransactionId = 1,
+			Side = Sides.Buy,
+			Price = 0, // Market order, no price
+			Balance = 10, // Needs 10, only 3 offered
+			Volume = 10,
+			OrderType = OrderTypes.Market,
+			TimeInForce = TimeInForce.MatchOrCancel, // FOK
+		};
+
+		var result = matcher.Match(order, book, DefaultSettings);
+
+		// Fill-or-kill is a property of the order, not of the price it names: a market order the book
+		// cannot fill in full is killed whole, exactly as the limit FOK path kills it. Anything else
+		// hands the caller a part fill it explicitly refused to take.
+		IsFalse(result.HasTrades);
+		AreEqual(10m, result.RemainingVolume);
+		AreEqual(OrderStates.Done, result.FinalState);
+		IsFalse(result.ShouldPlaceInBook);
+
+		// Killed means no market impact: the three lots offered are still offered.
+		AreEqual(3m, book.GetVolumeAtPrice(Sides.Sell, 101));
+		IsNotNull(book.BestAsk);
+		AreEqual(3m, book.BestAsk.Value.volume);
+	}
+
+	[TestMethod]
+	public void Match_MarketFOK_FullLiquidity_FillsEntirely()
+	{
+		var book = CreateBookWithSpread(bid: 100, ask: 101, volume: 10);
+		var matcher = new OrderMatcher();
+
+		var order = new EmulatorOrder
+		{
+			TransactionId = 1,
+			Side = Sides.Buy,
+			Price = 0, // Market order, no price
+			Balance = 10, // Exactly what the ask offers
+			Volume = 10,
+			OrderType = OrderTypes.Market,
+			TimeInForce = TimeInForce.MatchOrCancel, // FOK
+		};
+
+		var result = matcher.Match(order, book, DefaultSettings);
+
+		// The other half of the same contract: fill-or-kill on a market order that the book can fill
+		// in full has to fill it, not be refused for naming no price.
+		IsTrue(result.HasTrades);
+		AreEqual(0m, result.RemainingVolume);
+		AreEqual(OrderStates.Done, result.FinalState);
+		IsFalse(result.ShouldPlaceInBook);
+		AreEqual(10m, result.Trades.Sum(t => t.Volume));
+	}
+
+	[TestMethod]
 	public void Match_IOC_PartialLiquidity_PartialMatch()
 	{
 		var book = CreateBookWithSpread(bid: 100, ask: 101, volume: 3);

@@ -1205,6 +1205,70 @@ public class MarketEmulatorTests : BaseTestClass
 		}
 	}
 
+	/// <summary>
+	/// The active state emitted at a candle's low time must carry that low, and must not carry a high
+	/// that only prints later. A strategy watching an unfinished candle otherwise never sees the dip,
+	/// and sees a spike before it happened.
+	/// </summary>
+	[TestMethod]
+	public async Task ActiveCandleStates_LowStateCarriesTheLow()
+	{
+		var id = Helper.CreateSecurityId();
+		var emu = CreateEmuWithEvents(id, out var res);
+
+		var openTime = new DateTime(2026, 1, 2, 10, 0, 0, DateTimeKind.Utc);
+		var lowTime = openTime.AddMinutes(2);
+		var highTime = openTime.AddMinutes(4);
+		var closeTime = openTime.AddMinutes(5);
+
+		var subscriptionId = _idGenerator.GetNextId();
+
+		await emu.SendInMessageAsync(new MarketDataMessage
+		{
+			TransactionId = subscriptionId,
+			DataType2 = TimeSpan.FromMinutes(5).TimeFrame(),
+			SecurityId = id,
+			IsSubscribe = true,
+			IsFinishedOnly = false,
+		}, CancellationToken);
+
+		await emu.SendInMessageAsync(new TimeFrameCandleMessage
+		{
+			SecurityId = id,
+			OriginalTransactionId = subscriptionId,
+			TypedArg = TimeSpan.FromMinutes(5),
+			LocalTime = openTime,
+			OpenTime = openTime,
+			HighTime = highTime,
+			LowTime = lowTime,
+			CloseTime = closeTime,
+			OpenPrice = 100,
+			HighPrice = 110,
+			LowPrice = 90,
+			ClosePrice = 105,
+			TotalVolume = 10,
+			State = CandleStates.Finished,
+		}, CancellationToken);
+
+		await emu.SendInMessageAsync(new TimeMessage { LocalTime = closeTime }, CancellationToken);
+
+		var states = res
+			.OfType<TimeFrameCandleMessage>()
+			.Where(c => c.State == CandleStates.Active)
+			.ToArray();
+
+		AreEqual(3, states.Length, $"the open, the low and the high are three active states, got {states.Select(c => $"{c.LocalTime:HH:mm}").JoinComma()}");
+
+		var lowState = states.FirstOrDefault(c => c.LocalTime == lowTime);
+		IsNotNull(lowState, $"no active state at the low time {lowTime:O}");
+		AreEqual(90m, lowState.LowPrice, "the state emitted at the low time must report the low the candle reached");
+		AreEqual(100m, lowState.HighPrice, "at the low time the candle has not printed its high yet - that comes two minutes later");
+
+		var highState = states.FirstOrDefault(c => c.LocalTime == highTime);
+		IsNotNull(highState, $"no active state at the high time {highTime:O}");
+		AreEqual(110m, highState.HighPrice, "the state emitted at the high time must report the high the candle reached");
+	}
+
 	[TestMethod]
 	public async Task CandleExecution()
 	{
@@ -2692,5 +2756,354 @@ public class MarketEmulatorTests : BaseTestClass
 		var position = ((MarketEmulator)emu).PortfolioManager.GetPortfolio(_pfName).GetPosition(id);
 
 		AreEqual(0m, position.BeginValue + position.CurrentValue, "a strategy that opens from flat can open again");
+	}
+
+	/// <summary>
+	/// <see cref="RealTimeEmulationTrader{T}"/> promises a real market data connection but no real
+	/// order registration, and its portfolio argument is documented as the account orders are
+	/// registered through - not as a switch between emulated and live. So a full order lifecycle
+	/// through a custom portfolio must leave the underlying adapter untouched by every transactional
+	/// message: register, replace, cancel and group cancel - four sent, zero expected there.
+	/// </summary>
+	private async Task AssertNoRealOrdersReachUnderlyingAsync(bool ownAdapter)
+	{
+		var secId = Helper.CreateSecurityId();
+		var portfolio = new Portfolio { Name = "LiveAccount", BeginValue = 1000000 };
+
+		var underlying = new RecordingMessageAdapter();
+
+		using var trader = new RealTimeEmulationTrader<RecordingMessageAdapter>(
+			underlying,
+			new CollectionSecurityProvider([new Security { Id = secId.ToStringId() }]),
+			portfolio,
+			ownAdapter);
+
+		var adapter = trader.EmulationAdapter;
+
+		// Market data is the one thing that must reach the real connection. It is asserted below so
+		// that the absence of order messages is a routing fact and not a disconnected recorder.
+		await adapter.SendInMessageAsync(new MarketDataMessage
+		{
+			TransactionId = _idGenerator.GetNextId(),
+			SecurityId = secId,
+			DataType2 = DataType.MarketDepth,
+			IsSubscribe = true,
+		}, CancellationToken);
+
+		var regId = _idGenerator.GetNextId();
+
+		await adapter.SendInMessageAsync(new OrderRegisterMessage
+		{
+			SecurityId = secId,
+			TransactionId = regId,
+			PortfolioName = portfolio.Name,
+			Side = Sides.Buy,
+			Volume = 1,
+			Price = 100,
+			OrderType = OrderTypes.Limit,
+		}, CancellationToken);
+
+		await adapter.SendInMessageAsync(new OrderReplaceMessage
+		{
+			SecurityId = secId,
+			TransactionId = _idGenerator.GetNextId(),
+			OriginalTransactionId = regId,
+			PortfolioName = portfolio.Name,
+			Side = Sides.Buy,
+			Volume = 1,
+			Price = 99,
+			OrderType = OrderTypes.Limit,
+		}, CancellationToken);
+
+		await adapter.SendInMessageAsync(new OrderCancelMessage
+		{
+			SecurityId = secId,
+			TransactionId = _idGenerator.GetNextId(),
+			OriginalTransactionId = regId,
+			PortfolioName = portfolio.Name,
+		}, CancellationToken);
+
+		await adapter.SendInMessageAsync(new OrderGroupCancelMessage
+		{
+			TransactionId = _idGenerator.GetNextId(),
+			PortfolioName = portfolio.Name,
+		}, CancellationToken);
+
+		var recorded = underlying.InMessages.ToArray();
+
+		IsNotEmpty(recorded.OfType<MarketDataMessage>().ToArray(), "market data must still travel to the real connection");
+
+		var leaked = recorded.OfType<OrderMessage>().Select(m => $"{m.Type}").ToArray();
+
+		IsEmpty(leaked, $"orders sent to the real connection by an emulator: {leaked.JoinComma()}");
+	}
+
+	/// <summary>
+	/// The default construction: the emulator owns the underlying adapter. Naming the portfolio
+	/// something other than the simulator account must not turn emulation into live trading.
+	/// </summary>
+	[TestMethod]
+	public Task RealTimeEmulationRegistersNoRealOrderWhenItOwnsTheAdapter()
+		=> AssertNoRealOrdersReachUnderlyingAsync(true);
+
+	/// <summary>
+	/// The same promise when the underlying adapter is borrowed from a live connector, which is how
+	/// the shipped samples build it.
+	/// </summary>
+	[TestMethod]
+	public Task RealTimeEmulationRegistersNoRealOrderWhenTheAdapterIsBorrowed()
+		=> AssertNoRealOrdersReachUnderlyingAsync(false);
+
+	/// <summary>
+	/// History is a handful of prints standing for what was really thousands of them, so the size of
+	/// the print that trades through a resting limit says nothing about how much of that order could
+	/// have been done there. The market reaching the order's price takes the whole of it, once, at the
+	/// price that traded. Capping the fill at the print's own size would leave a strategy holding a
+	/// remainder of a backtested order it never planned for, and split one order into a stream of
+	/// micro-fills whenever the recorded prints are fractional.
+	/// </summary>
+	[TestMethod]
+	public async Task ATickThroughARestingLimitFillsItWhole()
+	{
+		var id = Helper.CreateSecurityId();
+		var emu = CreateEmuWithEvents(id, out var res);
+		var now = DateTime.UtcNow;
+
+		await AddBookAsync(emu, id, now);
+
+		// A buy of 10 at 95 rests: the market is 100/101, so nothing in the book crosses it.
+		var reg = new OrderRegisterMessage
+		{
+			SecurityId = id,
+			LocalTime = now,
+			TransactionId = _idGenerator.GetNextId(),
+			Side = Sides.Buy,
+			Price = 95,
+			Volume = 10,
+			OrderType = OrderTypes.Limit,
+			PortfolioName = _pfName,
+		};
+
+		await emu.SendInMessageAsync(reg, CancellationToken);
+
+		ExecutionMessage[] FillsOfTheOrder() => [.. res
+			.OfType<ExecutionMessage>()
+			.Where(m => m.OriginalTransactionId == reg.TransactionId && m.HasTradeInfo())];
+
+		AreEqual(0, FillsOfTheOrder().Length, "the order rests to begin with, or there is nothing to trade through");
+
+		// One print of a single lot at 94 - below where the order stands.
+		await emu.SendInMessageAsync(new ExecutionMessage
+		{
+			SecurityId = id,
+			LocalTime = now.AddSeconds(1),
+			ServerTime = now.AddSeconds(1),
+			DataTypeEx = DataType.Ticks,
+			TradePrice = 94,
+			TradeVolume = 1,
+		}, CancellationToken);
+
+		var fills = FillsOfTheOrder();
+
+		AreEqual(1, fills.Length, $"the market traded through the order once, so it is filled once; volumes were {fills.Select(m => m.TradeVolume.ToString()).JoinComma()}");
+		AreEqual(10m, fills[0].TradeVolume, "for the whole order, not for the single lot the print happened to carry");
+		AreEqual(94m, fills[0].TradePrice, "at the price that traded through it");
+
+		var state = res
+			.OfType<ExecutionMessage>()
+			.Last(m => m.OriginalTransactionId == reg.TransactionId && m.HasOrderInfo && !m.HasTradeInfo());
+
+		AreEqual(OrderStates.Done, state.OrderState, "an order filled in full is finished, not still working");
+		AreEqual(0m, state.Balance, "with nothing left of it for the strategy to carry");
+	}
+
+	/// <summary>
+	/// A bar records when its high and its low happened, and replaying it has to walk them in that
+	/// order. The path a bar took decides which of two resting orders is reached first, and a strategy
+	/// that acts on the first fill - a stop, a bracket, a reversal - is backtested against the wrong
+	/// bar entirely when the replay guesses the path the other way round.
+	/// </summary>
+	[TestMethod]
+	public async Task CandleReplay_FollowsHighTimeAndLowTime()
+	{
+		var start = new DateTime(2026, 3, 2, 10, 0, 0, DateTimeKind.Utc);
+
+		// Replays one bar whose extremes are recorded at the stated times, against a buy the bar's low
+		// reaches and a sell its high reaches, and answers where each of the two fills landed.
+		async Task<(int buyAt, int sellAt)> ReplayAsync(DateTime highTime, DateTime lowTime)
+		{
+			var id = Helper.CreateSecurityId();
+			var emu = CreateEmuWithEvents(id, out var res);
+
+			await AddBookAsync(emu, id, start);
+
+			async Task<long> RestAsync(Sides side, decimal price)
+			{
+				var reg = new OrderRegisterMessage
+				{
+					SecurityId = id,
+					LocalTime = start,
+					TransactionId = _idGenerator.GetNextId(),
+					Side = side,
+					Price = price,
+					Volume = 1,
+					OrderType = OrderTypes.Limit,
+					PortfolioName = _pfName,
+				};
+
+				await emu.SendInMessageAsync(reg, CancellationToken);
+				return reg.TransactionId;
+			}
+
+			// A buy under the market and a sell above it: the bar's low reaches one, its high the other.
+			var buyTx = await RestAsync(Sides.Buy, 95);
+			var sellTx = await RestAsync(Sides.Sell, 105);
+
+			await emu.SendInMessageAsync(new TimeFrameCandleMessage
+			{
+				SecurityId = id,
+				OpenTime = start,
+				CloseTime = start.AddMinutes(1),
+				LocalTime = start.AddMinutes(1),
+				HighTime = highTime,
+				LowTime = lowTime,
+				OpenPrice = 100,
+				HighPrice = 110,
+				LowPrice = 90,
+				ClosePrice = 100,
+				TotalVolume = 100,
+			}, CancellationToken);
+
+			// The bar has closed, so it is replayed as the prints it stands for.
+			await emu.SendInMessageAsync(new TimeMessage
+			{
+				LocalTime = start.AddMinutes(2),
+				ServerTime = start.AddMinutes(2),
+			}, CancellationToken);
+
+			var trades = res.OfType<ExecutionMessage>().Where(m => m.HasTradeInfo()).ToArray();
+
+			var buy = trades.FirstOrDefault(m => m.OriginalTransactionId == buyTx);
+			var sell = trades.FirstOrDefault(m => m.OriginalTransactionId == sellTx);
+
+			IsNotNull(buy, "the bar traded down to 90, which is through the buy standing at 95");
+			IsNotNull(sell, "and up to 110, which is through the sell standing at 105");
+
+			AreEqual(90m, buy.TradePrice, "the buy is filled at the low the bar recorded");
+			AreEqual(110m, sell.TradePrice, "and the sell at its high");
+
+			return (trades.IndexOf(buy), trades.IndexOf(sell));
+		}
+
+		var lowCameFirst = await ReplayAsync(highTime: start.AddSeconds(50), lowTime: start.AddSeconds(10));
+
+		IsLess(lowCameFirst.buyAt, lowCameFirst.sellAt,
+			"the bar recorded its low before its high, so the order the low reaches has to be filled first");
+
+		var highCameFirst = await ReplayAsync(highTime: start.AddSeconds(10), lowTime: start.AddSeconds(50));
+
+		IsLess(highCameFirst.sellAt, highCameFirst.buyAt,
+			"and recorded the other way round, the order the high reaches has to be filled first");
+	}
+
+	// Sends one print, which is what the emulator builds a session's price band from.
+	private async Task PrintAsync(IMarketEmulator emu, SecurityId secId, DateTime time, decimal price)
+	{
+		await emu.SendInMessageAsync(new ExecutionMessage
+		{
+			SecurityId = secId,
+			LocalTime = time,
+			ServerTime = time,
+			DataTypeEx = DataType.Ticks,
+			TradePrice = price,
+			TradeVolume = 10,
+		}, CancellationToken);
+	}
+
+	/// <summary>
+	/// An exchange names the floor and the ceiling a price may not leave for the session, and a
+	/// strategy reads them to place a protective order inside the band or to refuse one it knows
+	/// would be turned away. History replayed as bare prints carries no such quote, so the emulator
+	/// owes the strategy one built around the session's first print - without it the same strategy
+	/// reads the band as absent in the backtest that was meant to predict how it behaves live.
+	/// </summary>
+	[TestMethod]
+	public async Task TheFirstPrintOfASessionPublishesThePriceBandForThatSession()
+	{
+		var id = Helper.CreateSecurityId();
+		var emu = CreateEmuWithEvents(id, out var res);
+
+		emu.Settings.PriceLimitOffset = new Unit(10);
+
+		var session = new DateTime(2026, 3, 2, 10, 0, 0, DateTimeKind.Utc);
+
+		await PrintAsync(emu, id, session, 100);
+
+		var bands = res.OfType<Level1ChangeMessage>().ToArray();
+
+		HasCount(1, bands, "the session's first print settles the band, so exactly one has to be published");
+
+		var band = bands[0];
+
+		AreEqual(90m, band.TryGetDecimal(Level1Fields.MinPrice), "the floor stands the offset below the first print");
+		AreEqual(110m, band.TryGetDecimal(Level1Fields.MaxPrice), "and the ceiling the same offset above it");
+		AreEqual(id, band.SecurityId, "the band belongs to the security that printed");
+		AreEqual(session, band.ServerTime, "and is stamped with the moment that print happened");
+	}
+
+	/// <summary>
+	/// The band is the session's, not the latest print's. Recomputing it on every print would make it
+	/// trail the price, so nothing could ever sit outside it and a strategy reading it would learn
+	/// nothing about how far the market may still move; it would also bury the run under one quote per
+	/// print. A strategy is entitled to a band that stands still for as long as the session does.
+	/// </summary>
+	[TestMethod]
+	public async Task ThePriceBandIsSetOnceASessionAndDoesNotChaseLaterPrints()
+	{
+		var id = Helper.CreateSecurityId();
+		var emu = CreateEmuWithEvents(id, out var res);
+
+		emu.Settings.PriceLimitOffset = new Unit(10);
+
+		var open = new DateTime(2026, 3, 2, 10, 0, 0, DateTimeKind.Utc);
+
+		await PrintAsync(emu, id, open, 100);
+		await PrintAsync(emu, id, open.AddHours(4), 104);
+
+		var bands = res.OfType<Level1ChangeMessage>().ToArray();
+
+		HasCount(1, bands, $"the band is the session's, so the later print publishes none of its own; got {bands.Length}");
+
+		AreEqual(90m, bands[0].TryGetDecimal(Level1Fields.MinPrice), "and the floor still stands where the session opened");
+		AreEqual(110m, bands[0].TryGetDecimal(Level1Fields.MaxPrice), "as does the ceiling");
+	}
+
+	/// <summary>
+	/// The band belongs to one session, and the next one opens its own around where it opened. A
+	/// backtest spanning days that kept the first day's band would judge every later day against a
+	/// floor and a ceiling the market had long since walked away from, and a strategy that declines
+	/// to trade outside the band would refuse to trade at all after the first big move.
+	/// </summary>
+	[TestMethod]
+	public async Task EachSessionGetsItsOwnPriceBandBuiltFromItsOwnFirstPrint()
+	{
+		var id = Helper.CreateSecurityId();
+		var emu = CreateEmuWithEvents(id, out var res);
+
+		emu.Settings.PriceLimitOffset = new Unit(10);
+
+		var firstSession = new DateTime(2026, 3, 2, 10, 0, 0, DateTimeKind.Utc);
+		var nextSession = firstSession.AddDays(1);
+
+		await PrintAsync(emu, id, firstSession, 100);
+		await PrintAsync(emu, id, nextSession, 130);
+
+		var bands = res.OfType<Level1ChangeMessage>().ToArray();
+
+		HasCount(2, bands, $"each session opens a band of its own; got {bands.Length}");
+
+		AreEqual(120m, bands[1].TryGetDecimal(Level1Fields.MinPrice), "the new session's floor is measured from its own first print, not yesterday's");
+		AreEqual(140m, bands[1].TryGetDecimal(Level1Fields.MaxPrice), "and so is its ceiling");
+		AreEqual(nextSession, bands[1].ServerTime, "and the band is stamped with the session it belongs to");
 	}
 }

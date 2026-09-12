@@ -612,6 +612,265 @@ public class StrategyDecomposedTests : BaseTestClass
 		pipeline.MyTrades.Any().AssertFalse();
 	}
 
+	// Wraps a real PnL manager so one stage of the trade pipeline can be made to fail for a single
+	// delivery and the very same trade then redelivered.
+	private sealed class FailingPnLManager(IPnLManager inner) : IPnLManager
+	{
+		private readonly IPnLManager _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+
+		public bool FailUpdateSecurity { get; set; }
+		public bool FailProcessTrade { get; set; }
+
+		// Fills the manager actually took in - a redelivery it recognises as already valued does not count.
+		public int FillsTaken { get; private set; }
+
+		public decimal RealizedPnL => _inner.RealizedPnL;
+
+		public decimal UnrealizedPnL => _inner.UnrealizedPnL;
+
+		public void Reset() => _inner.Reset();
+
+		public void UpdateSecurity(Level1ChangeMessage l1Msg)
+		{
+			if (FailUpdateSecurity)
+				throw new InvalidOperationException("security feed failed");
+
+			_inner.UpdateSecurity(l1Msg);
+		}
+
+		public PnLInfo ProcessMessage(Message message, ICollection<PortfolioPnLManager> changedPortfolios = null)
+		{
+			var isFill = message is ExecutionMessage { TradeId: not null };
+
+			if (isFill && FailProcessTrade)
+				throw new InvalidOperationException("pnl failed");
+
+			var info = _inner.ProcessMessage(message, changedPortfolios);
+
+			if (isFill && info is not null)
+				FillsTaken++;
+
+			return info;
+		}
+
+		public void Load(SettingsStorage storage) => _inner.Load(storage);
+
+		public void Save(SettingsStorage storage) => _inner.Save(storage);
+
+		public IPnLManager Clone() => _inner.Clone();
+
+		object ICloneable.Clone() => Clone();
+	}
+
+	// The same idea for the statistics stage, which runs last.
+	private sealed class FailingStatisticManager(IStatisticManager inner) : IStatisticManager
+	{
+		private readonly IStatisticManager _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+
+		public bool FailAddMyTrade { get; set; }
+
+		public int MyTradesAdded { get; private set; }
+
+		public IStatisticParameter[] Parameters => _inner.Parameters;
+
+		public void AddPnL(DateTime time, decimal pnl, decimal? commission) => _inner.AddPnL(time, pnl, commission);
+
+		public void AddPosition(DateTime time, decimal position) => _inner.AddPosition(time, position);
+
+		public void AddMyTrade(PnLInfo info)
+		{
+			if (FailAddMyTrade)
+				throw new InvalidOperationException("statistics failed");
+
+			_inner.AddMyTrade(info);
+			MyTradesAdded++;
+		}
+
+		public void AddNewOrder(Order order) => _inner.AddNewOrder(order);
+
+		public void AddChangedOrder(Order order) => _inner.AddChangedOrder(order);
+
+		public void AddRegisterFailedOrder(OrderFail fail) => _inner.AddRegisterFailedOrder(fail);
+
+		public void AddFailedOrderCancel(OrderFail fail) => _inner.AddFailedOrderCancel(fail);
+
+		public void Reset() => _inner.Reset();
+
+		public void Load(SettingsStorage storage) => _inner.Load(storage);
+
+		public void Save(SettingsStorage storage) => _inner.Save(storage);
+
+		public void Dispose() => _inner.Dispose();
+	}
+
+	// The statistic manager setter is protected, and the statistics stage has to be made to fail.
+	private sealed class StatsSwapStrategy : Strategy
+	{
+		public void UseStatisticManager(IStatisticManager manager) => StatisticManager = manager;
+	}
+
+	private static Subscription StartTransactionSubscription(Strategy strategy)
+	{
+		var sub = new Subscription(DataType.Transactions);
+		strategy.Subscriptions.Subscribe(sub);
+		return sub;
+	}
+
+	// Registers one order the way the connector delivers it - Pending, then Active - and builds its fill
+	// without delivering it, so a caller can deliver, fail, and redeliver the same trade object.
+	private static MyTrade PrepareFill(Strategy strategy, Subscription sub, Security security, Portfolio portfolio,
+		Sides side, decimal price, decimal volume, long txId, long tradeId, decimal commission)
+	{
+		var order = CreateNewFeatureOrder(security, portfolio, side, price, volume, txId);
+		order.Balance = order.Volume;
+
+		strategy.OnConnectorOrderReceived(sub, order);
+
+		order.State = OrderStates.Active;
+		strategy.OnConnectorOrderReceived(sub, order);
+
+		var trade = CreateNewFeatureTrade(order, tradeId, price, volume);
+		trade.Commission = commission;
+
+		return trade;
+	}
+
+	// The opening leg the retry tests share: a clean buy of 10 at 100 carrying 2 of commission.
+	private static void DeliverOpeningLeg(Strategy strategy, Subscription sub, Security security, Portfolio portfolio)
+		=> strategy.OnTradeReceived(sub, PrepareFill(strategy, sub, security, portfolio,
+			Sides.Buy, 100m, 10m, txId: 1, tradeId: 1, commission: 2m));
+
+	// What every retry test is entitled to once the closing fill has been redelivered: long 10 at 100
+	// closed by 4 at 110 leaves position 10 - 4 = 6, realized PnL (110 - 100) * 4 = 40 (step price is
+	// unset, so the multiplier is 1) and commission 2 + 3 = 5. Each fill counts once, not zero times
+	// because the retry was refused and not twice because it was replayed.
+	private static void AssertBothFillsAppliedOnce(Strategy strategy, FailingPnLManager pnl, List<MyTrade> ownTrades)
+	{
+		AreEqual(6m, strategy.Position, "10 bought, 4 sold");
+		AreEqual(40m, pnl.RealizedPnL, "(110 - 100) * 4");
+		AreEqual<decimal?>(5m, strategy.Commission, "2 on the opening fill plus 3 on the closing one");
+		AreEqual(2, pnl.FillsTaken, "Each fill is valued exactly once");
+		AreEqual(2, strategy.MyTrades.Count(), "Each fill is tracked exactly once");
+		AreEqual(2, ownTrades.Count, "Each fill is reported to the strategy exactly once");
+	}
+
+	[TestMethod]
+	public void TradePipeline_SecurityFeedFailsThenTradeRedelivered_AppliesFillExactlyOnce()
+	{
+		// The security snapshot runs after the trade is already listed and its commission counted. A
+		// caller that redelivers the fill is owed a whole trade, applied once - not a permanent half of one.
+
+		var security = CreateSecurity();
+		var portfolio = CreatePortfolio();
+		var pnl = new FailingPnLManager(new PnLManager());
+
+		var strategy = new Strategy
+		{
+			Connector = CreateMockConnector().Object,
+			Security = security,
+			Portfolio = portfolio,
+			PnLManager = pnl,
+		};
+
+		var ownTrades = new List<MyTrade>();
+		strategy.OwnTradeReceived += (_, t) => ownTrades.Add(t);
+
+		var sub = StartTransactionSubscription(strategy);
+
+		DeliverOpeningLeg(strategy, sub, security, portfolio);
+
+		var closing = PrepareFill(strategy, sub, security, portfolio,
+			Sides.Sell, 110m, 4m, txId: 2, tradeId: 2, commission: 3m);
+
+		pnl.FailUpdateSecurity = true;
+		Throws<InvalidOperationException>(() => strategy.OnTradeReceived(sub, closing));
+
+		pnl.FailUpdateSecurity = false;
+		strategy.OnTradeReceived(sub, closing);
+
+		AssertBothFillsAppliedOnce(strategy, pnl, ownTrades);
+	}
+
+	[TestMethod]
+	public void TradePipeline_PnLStageFailsThenTradeRedelivered_AppliesFillExactlyOnce()
+	{
+		// The PnL stage runs after the commission is already accumulated, so a failure there leaves the
+		// trade counted but unvalued. Redelivering the fill must complete it.
+
+		var security = CreateSecurity();
+		var portfolio = CreatePortfolio();
+		var pnl = new FailingPnLManager(new PnLManager());
+
+		var strategy = new Strategy
+		{
+			Connector = CreateMockConnector().Object,
+			Security = security,
+			Portfolio = portfolio,
+			PnLManager = pnl,
+		};
+
+		var ownTrades = new List<MyTrade>();
+		strategy.OwnTradeReceived += (_, t) => ownTrades.Add(t);
+
+		var sub = StartTransactionSubscription(strategy);
+
+		DeliverOpeningLeg(strategy, sub, security, portfolio);
+
+		var closing = PrepareFill(strategy, sub, security, portfolio,
+			Sides.Sell, 110m, 4m, txId: 2, tradeId: 2, commission: 3m);
+
+		pnl.FailProcessTrade = true;
+		Throws<InvalidOperationException>(() => strategy.OnTradeReceived(sub, closing));
+
+		pnl.FailProcessTrade = false;
+		strategy.OnTradeReceived(sub, closing);
+
+		AssertBothFillsAppliedOnce(strategy, pnl, ownTrades);
+	}
+
+	[TestMethod]
+	public void TradePipeline_StatisticsStageFailsThenTradeRedelivered_AppliesFillExactlyOnce()
+	{
+		// The statistics stage runs last, after position, commission and PnL have all moved. Redelivering
+		// the fill must finish it off rather than be turned away as a duplicate.
+
+		var security = CreateSecurity();
+		var portfolio = CreatePortfolio();
+		var pnl = new FailingPnLManager(new PnLManager());
+
+		using var innerStats = new StatisticManager();
+		var stats = new FailingStatisticManager(innerStats);
+
+		var strategy = new StatsSwapStrategy
+		{
+			Connector = CreateMockConnector().Object,
+			Security = security,
+			Portfolio = portfolio,
+			PnLManager = pnl,
+		};
+
+		strategy.UseStatisticManager(stats);
+
+		var ownTrades = new List<MyTrade>();
+		strategy.OwnTradeReceived += (_, t) => ownTrades.Add(t);
+
+		var sub = StartTransactionSubscription(strategy);
+
+		DeliverOpeningLeg(strategy, sub, security, portfolio);
+
+		var closing = PrepareFill(strategy, sub, security, portfolio,
+			Sides.Sell, 110m, 4m, txId: 2, tradeId: 2, commission: 3m);
+
+		stats.FailAddMyTrade = true;
+		Throws<InvalidOperationException>(() => strategy.OnTradeReceived(sub, closing));
+
+		stats.FailAddMyTrade = false;
+		strategy.OnTradeReceived(sub, closing);
+
+		AssertBothFillsAppliedOnce(strategy, pnl, ownTrades);
+		AreEqual(2, stats.MyTradesAdded, "Each fill reaches the statistics exactly once");
+	}
+
 	#endregion
 
 	#region PositionPipeline tests
@@ -817,6 +1076,124 @@ public class StrategyDecomposedTests : BaseTestClass
 		registry.ResumeRules();
 		registry.IsRulesSuspended.AssertFalse();
 		requestedSubs.Count.AreEqual(1);
+	}
+
+	[TestMethod]
+	public void SubscriptionRegistry_UnSubscribeAllWhileSuspended_DoesNotSendCancelledSubscriptionOnResume()
+	{
+		// A subscription cancelled while the rules are suspended is no longer wanted, so resuming must
+		// not hand it to the connector after the fact.
+
+		var host = new FakeHost();
+		var registry = new SubscriptionRegistry(host);
+
+		var requested = new List<Subscription>();
+		registry.SubscriptionRequested += requested.Add;
+
+		registry.SuspendRules();
+
+		var sub = new Subscription(DataType.Level1);
+		registry.Subscribe(sub);
+
+		registry.UnSubscribeAll(globalAndLocal: true);
+
+		registry.CanProcess(sub).AssertFalse();
+
+		registry.ResumeRules();
+
+		AreEqual(0, requested.Count, "A cancelled subscription must not be sent when the rules resume");
+		IsNull(registry.TryGetById(sub.TransactionId), "A cancelled subscription is no longer addressable by id");
+	}
+
+	[TestMethod]
+	public void SubscriptionRegistry_UnSubscribeAllLocalWhileSuspended_ResumesOnlyGlobalSubscription()
+	{
+		// UnSubscribeAll(false) spares the global lookups and cancels the local ones; the resume owes the
+		// connector the survivor only.
+
+		var host = new FakeHost();
+		var registry = new SubscriptionRegistry(host);
+
+		var requested = new List<Subscription>();
+		registry.SubscriptionRequested += requested.Add;
+
+		registry.SuspendRules();
+
+		var local = new Subscription(DataType.Level1);
+		var globalLookup = new Subscription(DataType.Securities);
+
+		registry.Subscribe(local);
+		registry.Subscribe(globalLookup, isGlobal: true);
+
+		registry.UnSubscribeAll(globalAndLocal: false);
+
+		registry.CanProcess(local).AssertFalse();
+		registry.CanProcess(globalLookup).AssertTrue();
+
+		registry.ResumeRules();
+
+		AreEqual(1, requested.Count, "Only the global lookup outlives an unsubscribe of the local subscriptions");
+		AreSame(globalLookup, requested.FirstOrDefault());
+	}
+
+	[TestMethod]
+	public void SubscriptionRegistry_NestedSuspendUnSubscribeAll_DoesNotSendCancelledSubscriptionOnFinalResume()
+	{
+		// The queue is flushed by the resume that unwinds the last suspend, so the cancellation has to
+		// outlive the whole nesting, not just the innermost level.
+
+		var host = new FakeHost();
+		var registry = new SubscriptionRegistry(host);
+
+		var requested = new List<Subscription>();
+		registry.SubscriptionRequested += requested.Add;
+
+		registry.SuspendRules();
+		registry.SuspendRules();
+
+		var sub = new Subscription(DataType.Level1);
+		registry.Subscribe(sub);
+
+		registry.UnSubscribeAll(globalAndLocal: true);
+
+		registry.ResumeRules();
+
+		registry.IsRulesSuspended.AssertTrue();
+		AreEqual(0, requested.Count, "The inner resume flushes nothing");
+
+		registry.ResumeRules();
+
+		registry.IsRulesSuspended.AssertFalse();
+		AreEqual(0, requested.Count, "A cancelled subscription must not be sent when the last suspend unwinds");
+	}
+
+	[TestMethod]
+	public void SubscriptionRegistry_UnSubscribeAllWhileSuspended_UnsubscribesOnlyWhatWasSent()
+	{
+		// UnSubscribe drops a still-queued subscription without telling the connector, because the
+		// connector never heard of it. UnSubscribeAll cancels both kinds and owes the same answer.
+
+		var host = new FakeHost();
+		var registry = new SubscriptionRegistry(host);
+
+		var unsubscribed = new List<Subscription>();
+		registry.UnsubscriptionRequested += unsubscribed.Add;
+
+		var sent = new Subscription(DataType.Level1);
+		registry.Subscribe(sent);
+
+		registry.SuspendRules();
+
+		var queued = new Subscription(DataType.Ticks);
+		registry.Subscribe(queued);
+
+		registry.UnSubscribeAll(globalAndLocal: true);
+
+		AreEqual(1, unsubscribed.Count, "Only the subscription the connector actually received is unsubscribed");
+		AreSame(sent, unsubscribed.FirstOrDefault());
+
+		registry.CanProcess(sent).AssertFalse();
+		registry.CanProcess(queued).AssertFalse();
 	}
 
 	#endregion
@@ -1642,8 +2019,8 @@ public class StrategyDecomposedTests : BaseTestClass
 	[TestMethod]
 	public void Composite_RoundTrip_TrackedFromTrades()
 	{
-		// When position goes from 0 → open → 0, a round-trip should be recorded.
-		// Currently Strategy has no PositionLifecycleTracker.
+		// Pins the whole round-trip path, not just where it ends: buying 5 opens the position to +5
+		// and selling those 5 brings it back to 0, so the observed path must be 0 -> +5 -> 0.
 
 		var connMock = CreateMockConnector();
 		var security = CreateSecurity();
@@ -1659,6 +2036,16 @@ public class StrategyDecomposedTests : BaseTestClass
 
 		var sub = new Subscription(DataType.Transactions);
 		strategy.Subscriptions.Subscribe(sub);
+
+		// The strategy keeps no round-trip history, so the path is collected from the position
+		// values reported while the fills are delivered, starting from the flat position.
+		var observed = new List<decimal> { strategy.Position };
+		var provider = (IPositionProvider)strategy;
+
+		void Track(Position pos) => observed.Add(pos.CurrentValue ?? 0);
+
+		provider.NewPosition += Track;
+		provider.PositionChanged += Track;
 
 		// buy order filled
 		var buyOrder = new Order
@@ -1682,6 +2069,9 @@ public class StrategyDecomposedTests : BaseTestClass
 			},
 		});
 
+		// One buy of 5 lots and nothing against it: the position stands at +5 before the closing order.
+		strategy.Position.AreEqual(5m);
+
 		// sell order filled — closes the position
 		var sellOrder = new Order
 		{
@@ -1704,10 +2094,20 @@ public class StrategyDecomposedTests : BaseTestClass
 			},
 		});
 
-		// position should be back to 0
+		// 5 bought then 5 sold leaves nothing open.
 		strategy.Position.AreEqual(0m);
 
-		// TODO: verify round-trip history when PositionLifecycleTracker is added
+		provider.NewPosition -= Track;
+		provider.PositionChanged -= Track;
+
+		// The same value can be reported more than once (order activation, blocked-volume updates);
+		// what the round trip is about is the values the position took, in order.
+		var path = observed.Where((v, i) => i == 0 || observed[i - 1] != v).ToArray();
+
+		path.Length.AreEqual(3);
+		path[0].AreEqual(0m);
+		path[1].AreEqual(5m);
+		path[2].AreEqual(0m);
 	}
 
 	[TestMethod]
@@ -1898,6 +2298,24 @@ public class StrategyDecomposedTests : BaseTestClass
 
 		connMock.Verify(c => c.RegisterOrder(It.IsAny<Order>()), Times.Never);
 		strategy.OrderProcessor.IsTracked(order).AssertFalse();
+	}
+
+	/// <summary>
+	/// A strategy with no connector has been told nothing about the market, so it has no market
+	/// time either - and must say so instead of answering with the clock of the machine it happens
+	/// to run on. Everything the strategy stamps before it is connected - order times, the moment
+	/// protection starts measuring from, the date its profit is refreshed against - carries that
+	/// answer, so a wall-clock reading turns a run over last year's data into one dated today.
+	/// </summary>
+	[TestMethod]
+	public void CurrentTimeWithoutAConnector_DoesNotFallBackToWallClock()
+	{
+		var strategy = new Strategy();
+
+		strategy.Connector.AssertNull("the strategy under test is deliberately unconnected");
+
+		strategy.CurrentTime.AssertEqual(default(DateTime),
+			$"an unconnected strategy has no market time, but it answered with something around the wall clock of {DateTime.UtcNow}");
 	}
 
 	#endregion
@@ -2852,6 +3270,212 @@ public class StrategyDecomposedTests : BaseTestClass
 		// Time stamp is the realizing trade's LocalTime (UTC), not default.
 		capturedTime.AreEqual(_newFeatureTradeTime);
 		capturedTime.Kind.AreEqual(DateTimeKind.Utc);
+	}
+
+	#endregion
+
+	#region Position seam: the order route and the trade route feeding the same order
+
+	// Orders arrive as cumulative snapshots and both routes hand the same Order to the position
+	// manager, so the same execution can reach it more than once. Applying it again must not move
+	// the strategy's position.
+
+	[TestMethod]
+	public void PositionSeam_TradeFillThenDoneOrderSnapshot_CountsFillOnce()
+	{
+		// A full fill delivered as a trade, then the same order redelivered on the order route already
+		// Done with zero balance: the strategy owns the fill once.
+
+		var connMock = CreateMockConnector();
+		var security = CreateSecurity();
+		var portfolio = CreatePortfolio();
+
+		var strategy = new Strategy
+		{
+			Connector = connMock.Object,
+			Security = security,
+			Portfolio = portfolio,
+		};
+
+		var sub = new Subscription(DataType.Transactions);
+		strategy.Subscriptions.Subscribe(sub);
+
+		var order = CreateNewFeatureOrder(security, portfolio, Sides.Buy, 100m, 10m, txId: 1);
+		order.Balance = order.Volume;
+
+		strategy.OnConnectorOrderReceived(sub, order);
+
+		order.State = OrderStates.Active;
+		strategy.OnConnectorOrderReceived(sub, order);
+
+		strategy.OnTradeReceived(sub, CreateNewFeatureTrade(order, tradeId: 1, price: 100m, volume: 10m));
+
+		strategy.Position.AreEqual(10m);
+		order.State.AreEqual(OrderStates.Done);
+		order.Balance.AreEqual(0m);
+
+		strategy.OnConnectorOrderReceived(sub, order);
+
+		AreEqual(10m, strategy.Position, "The finished order snapshot repeats a fill that is already owned");
+	}
+
+	[TestMethod]
+	public void PositionSeam_DoneOrderSnapshotDeliveredTwice_CountsFillOnce()
+	{
+		// Two transaction subscriptions deliver the same finished order: the fill counts once.
+
+		var connMock = CreateMockConnector();
+		var security = CreateSecurity();
+		var portfolio = CreatePortfolio();
+
+		var strategy = new Strategy
+		{
+			Connector = connMock.Object,
+			Security = security,
+			Portfolio = portfolio,
+		};
+
+		var sub1 = new Subscription(DataType.Transactions);
+		var sub2 = new Subscription(DataType.Transactions);
+		strategy.Subscriptions.Subscribe(sub1);
+		strategy.Subscriptions.Subscribe(sub2);
+
+		var order = CreateNewFeatureOrder(security, portfolio, Sides.Buy, 100m, 10m, txId: 1);
+		order.Balance = order.Volume;
+
+		strategy.OnConnectorOrderReceived(sub1, order);
+
+		order.State = OrderStates.Active;
+		strategy.OnConnectorOrderReceived(sub1, order);
+
+		order.State = OrderStates.Done;
+		order.Balance = 0m;
+
+		strategy.OnConnectorOrderReceived(sub1, order);
+		strategy.Position.AreEqual(10m);
+
+		strategy.OnConnectorOrderReceived(sub2, order);
+
+		AreEqual(10m, strategy.Position, "The second subscription carries the same fill, not another one");
+	}
+
+	[TestMethod]
+	public void PositionSeam_PartialTradeThenOrderSnapshotThenRest_CountsEachFillOnce()
+	{
+		// A partial fill through the trade route, then the matching order snapshot on the order route,
+		// then the rest of the fill: the position follows the executed volume, never doubles it.
+
+		var connMock = CreateMockConnector();
+		var security = CreateSecurity();
+		var portfolio = CreatePortfolio();
+
+		var strategy = new Strategy
+		{
+			Connector = connMock.Object,
+			Security = security,
+			Portfolio = portfolio,
+		};
+
+		var sub = new Subscription(DataType.Transactions);
+		strategy.Subscriptions.Subscribe(sub);
+
+		var order = CreateNewFeatureOrder(security, portfolio, Sides.Buy, 100m, 10m, txId: 1);
+		order.Balance = order.Volume;
+
+		strategy.OnConnectorOrderReceived(sub, order);
+
+		order.State = OrderStates.Active;
+		strategy.OnConnectorOrderReceived(sub, order);
+
+		strategy.OnTradeReceived(sub, CreateNewFeatureTrade(order, tradeId: 1, price: 100m, volume: 4m));
+		strategy.Position.AreEqual(4m);
+
+		// The connector delivers the partially filled order the trade already applied.
+		strategy.OnConnectorOrderReceived(sub, order);
+		AreEqual(4m, strategy.Position, "The order snapshot repeats the partial fill already owned");
+
+		strategy.OnTradeReceived(sub, CreateNewFeatureTrade(order, tradeId: 2, price: 100m, volume: 6m));
+		strategy.Position.AreEqual(10m);
+
+		strategy.OnConnectorOrderReceived(sub, order);
+		AreEqual(10m, strategy.Position, "The finished order snapshot adds nothing beyond the two fills");
+	}
+
+	[TestMethod]
+	public void PositionSeam_DoneOrderSnapshotThenTrade_CountsFillOnce()
+	{
+		// The routes in the other order: the finished order snapshot arrives first and the trade for the
+		// same execution follows it.
+
+		var connMock = CreateMockConnector();
+		var security = CreateSecurity();
+		var portfolio = CreatePortfolio();
+
+		var strategy = new Strategy
+		{
+			Connector = connMock.Object,
+			Security = security,
+			Portfolio = portfolio,
+		};
+
+		var sub = new Subscription(DataType.Transactions);
+		strategy.Subscriptions.Subscribe(sub);
+
+		var order = CreateNewFeatureOrder(security, portfolio, Sides.Buy, 100m, 10m, txId: 1);
+		order.Balance = order.Volume;
+
+		strategy.OnConnectorOrderReceived(sub, order);
+
+		order.State = OrderStates.Active;
+		strategy.OnConnectorOrderReceived(sub, order);
+
+		order.State = OrderStates.Done;
+		order.Balance = 0m;
+
+		strategy.OnConnectorOrderReceived(sub, order);
+		strategy.Position.AreEqual(10m);
+
+		strategy.OnTradeReceived(sub, CreateNewFeatureTrade(order, tradeId: 1, price: 100m, volume: 10m));
+
+		AreEqual(10m, strategy.Position, "The trade reports the execution the order snapshot already carried");
+	}
+
+	[TestMethod]
+	public void PositionSeam_OrdinaryOrderAndTradeTraffic_KeepsErrorStateInfo()
+	{
+		// Ordinary traffic - a Pending snapshot, a fill, a repeated finished snapshot - says nothing is
+		// wrong, so the strategy must still report itself healthy.
+
+		var connMock = CreateMockConnector();
+		var security = CreateSecurity();
+		var portfolio = CreatePortfolio();
+
+		var strategy = new Strategy
+		{
+			Connector = connMock.Object,
+			Security = security,
+			Portfolio = portfolio,
+		};
+
+		var sub = new Subscription(DataType.Transactions);
+		strategy.Subscriptions.Subscribe(sub);
+
+		MarkStarted(strategy);
+		AreEqual(LogLevels.Info, strategy.ErrorState, "A started strategy reports Info before any traffic");
+
+		var order = CreateNewFeatureOrder(security, portfolio, Sides.Buy, 100m, 10m, txId: 1);
+		order.Balance = order.Volume;
+
+		strategy.OnConnectorOrderReceived(sub, order);
+
+		order.State = OrderStates.Active;
+		strategy.OnConnectorOrderReceived(sub, order);
+
+		strategy.OnTradeReceived(sub, CreateNewFeatureTrade(order, tradeId: 1, price: 100m, volume: 10m));
+
+		strategy.OnConnectorOrderReceived(sub, order);
+
+		AreEqual(LogLevels.Info, strategy.ErrorState, "Nothing in this traffic is an error");
 	}
 
 	#endregion

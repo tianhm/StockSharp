@@ -1168,6 +1168,84 @@ public class SnapshotHolderTests : BaseTestClass
 		res.AssertNotSame(snap);
 	}
 
+	[TestMethod]
+	public void OrderBook_FirstSnapshotComplete_IsNotKeptAsCallerInstance()
+	{
+		// A book handed to the holder stays the caller's to reuse: the holder must keep its own
+		// copy, as it already does when State is null, instead of serving the caller's arrays back.
+		var holder = new OrderBookSnapshotHolder();
+
+		var book = new QuoteChangeMessage
+		{
+			SecurityId = _secId1,
+			ServerTime = _now,
+			State = QuoteChangeStates.SnapshotComplete,
+			Bids = [new QuoteChange(100m, 10)],
+			Asks = [new QuoteChange(101m, 20)],
+		};
+
+		holder.Process(book).AssertNotNull();
+
+		// the caller reuses its own message for the next book it builds
+		book.Bids[0] = new QuoteChange(999m, 1);
+
+		holder.TryGetSnapshot(_secId1, out var snap).AssertTrue();
+		snap.Bids.Length.AssertEqual(1);
+		snap.Bids[0].Price.AssertEqual(100m, "the holder served the book the caller had already overwritten");
+		snap.Bids[0].Volume.AssertEqual(10m);
+
+		holder.TryPeekSnapshot(_secId1, out var peeked).AssertTrue();
+		peeked.AssertNotSame(book);
+	}
+
+	[TestMethod]
+	public void OrderBook_ReplacementSnapshotComplete_IsNotKeptAsCallerInstance()
+	{
+		// The same for a book that replaces an existing snapshot: the next delta is measured
+		// against the replacement as it arrived, not against whatever the caller wrote into it after.
+		var holder = new OrderBookSnapshotHolder();
+
+		holder.Process(new QuoteChangeMessage
+		{
+			SecurityId = _secId1,
+			ServerTime = _now,
+			State = null,
+			Bids = [new QuoteChange(100m, 10)],
+			Asks = [new QuoteChange(101m, 20)],
+		}).AssertNotNull();
+
+		var replacement = new QuoteChangeMessage
+		{
+			SecurityId = _secId1,
+			ServerTime = _now.AddSeconds(1),
+			State = QuoteChangeStates.SnapshotComplete,
+			Bids = [new QuoteChange(102m, 5)],
+			Asks = [new QuoteChange(103m, 7)],
+		};
+
+		holder.Process(replacement).AssertNotNull();
+
+		// the caller reuses its own message again
+		replacement.Bids[0] = new QuoteChange(999m, 1);
+
+		holder.TryGetSnapshot(_secId1, out var snap).AssertTrue();
+		snap.Bids[0].Price.AssertEqual(102m, "the holder served the book the caller had already overwritten");
+
+		// an identical book that follows changes nothing, so its delta is empty
+		var delta = holder.Process(new QuoteChangeMessage
+		{
+			SecurityId = _secId1,
+			ServerTime = _now.AddSeconds(2),
+			State = QuoteChangeStates.SnapshotComplete,
+			Bids = [new QuoteChange(102m, 5)],
+			Asks = [new QuoteChange(103m, 7)],
+		});
+
+		delta.AssertNotNull();
+		delta.Bids.Length.AssertEqual(0, "the delta was measured against a book the caller had overwritten");
+		delta.Asks.Length.AssertEqual(0);
+	}
+
 	#endregion
 
 	[TestMethod]
@@ -1996,6 +2074,38 @@ public class SnapshotHolderTests : BaseTestClass
 		};
 
 		ThrowsExactly<InvalidOperationException>(() => holder.Process(msg2));
+	}
+
+	[TestMethod]
+	public void Order_StateTransition_PendingToDone_IsAcceptedForImmediateFill()
+	{
+		// An IOC order is acknowledged as Pending and reported filled in the next report, with no resting
+		// Active in between. The holder must fold that into a Done snapshot rather than reject the venue's
+		// own answer - refusing it turns every immediately filled order into an exception here.
+		var holder = new OrderSnapshotHolder { ThrowOnInvalidStateTransition = true };
+
+		holder.Process(new ExecutionMessage
+		{
+			TransactionId = 1,
+			SecurityId = _secId1,
+			ServerTime = _now,
+			HasOrderInfo = true,
+			OrderState = OrderStates.Pending,
+			Balance = 10m,
+		});
+
+		var snapshot = holder.Process(new ExecutionMessage
+		{
+			TransactionId = 1,
+			SecurityId = _secId1,
+			ServerTime = _now.AddSeconds(1),
+			HasOrderInfo = true,
+			OrderState = OrderStates.Done,
+			Balance = 0m,
+		});
+
+		snapshot.OrderState.AssertEqual(OrderStates.Done);
+		snapshot.Balance.AssertEqual(0m);
 	}
 
 	[TestMethod]

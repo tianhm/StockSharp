@@ -507,4 +507,43 @@ public class DataTypeTests : BaseTestClass
 		AreEqual(Minute, spec.CandleType);
 		AreEqual(20, spec.Parameters["Length"].To<int>());
 	}
+
+	/// <summary>
+	/// A specification is a value whose contents do not change once built, so what it hands out must
+	/// offer no way to write into it: a caller holding Parameters as a writable dictionary can edit
+	/// a specification other code is already using.
+	/// </summary>
+	[TestMethod]
+	public void IndicatorSpec_HandsOutParametersThatCannotBeWritten()
+	{
+		var spec = Sma(Minute, ("Length", 20));
+
+		var writable = spec.Parameters as IDictionary<string, object>;
+
+		IsTrue(writable is null || writable.IsReadOnly, "Parameters is handed out as a writable dictionary");
+	}
+
+	/// <summary>
+	/// What a write attempt costs: a request registered under Length=20 is looked up by an identical
+	/// request, and it must still be found after someone has tried to rewrite the parameters of the
+	/// specification the registration was made under.
+	/// </summary>
+	[TestMethod]
+	public void IndicatorSpec_SurvivesAWriteAttemptOnWhatItHandedOut()
+	{
+		var spec = Sma(Minute, ("Length", 20));
+
+		var subscriptions = new Dictionary<DataType, string>
+		{
+			{ DataType.Indicator(spec), "sma-20" },
+		};
+
+		// A read-only view either is not a writable dictionary at all or refuses the write; both are
+		// correct, and either way the specification must still say 20.
+		if (spec.Parameters is IDictionary<string, object> writable && !writable.IsReadOnly)
+			writable["Length"] = 50L;
+
+		AreEqual(20, spec.Parameters["Length"].To<int>());
+		IsTrue(subscriptions.ContainsKey(DataType.Indicator(Sma(Minute, ("Length", 20)))), "the subscription registered under Length=20 is no longer found");
+	}
 }

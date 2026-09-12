@@ -252,6 +252,114 @@ public class MarketRuleTests : BaseTestClass
 		firedAt[1].AssertEqual(times[1]);
 	}
 
+	private static Mock<ITimeProvider> CreateTimeProvider()
+	{
+		var mock = new Mock<ITimeProvider>(MockBehavior.Loose);
+		mock.SetupGet(p => p.CurrentTime).Returns(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+		return mock;
+	}
+
+	[TestMethod]
+	public void MarketTimerCarriesOvershootIntoTheNextInterval()
+	{
+		var mock = CreateTimeProvider();
+
+		var fired = 0;
+		using var timer = new MarketTimer(mock.Object, () => fired++).Interval(TimeSpan.FromSeconds(5)).Start();
+
+		// CurrentTimeChanged passes the difference since the previous call, so the diffs sum to the market
+		// time that has passed: 7 + 3 = 10 seconds, which a 5 second timer owes 10 / 5 = 2 activations.
+		// Neither step spans two whole intervals, so the count is the same whether a timer that fell
+		// behind coalesces the missed activations or replays them one by one.
+		mock.Raise(m => m.CurrentTimeChanged += null, TimeSpan.FromSeconds(7));
+		fired.AssertEqual(1);
+
+		mock.Raise(m => m.CurrentTimeChanged += null, TimeSpan.FromSeconds(3));
+		fired.AssertEqual(2);
+	}
+
+	[TestMethod]
+	public void MarketTimerDoesNotDriftOverSmallSteps()
+	{
+		var mock = CreateTimeProvider();
+
+		var fired = 0;
+		using var timer = new MarketTimer(mock.Object, () => fired++).Interval(TimeSpan.FromSeconds(5)).Start();
+
+		// 20 steps of 2 seconds is 40 seconds of market time, so a 5 second timer owes 40 / 5 = 8
+		// activations. Discarding the part of a step that overshot the interval would stretch the
+		// effective period to 6 seconds and lose two of them.
+		for (var i = 0; i < 20; i++)
+			mock.Raise(m => m.CurrentTimeChanged += null, TimeSpan.FromSeconds(2));
+
+		fired.AssertEqual(8);
+	}
+
+	[TestMethod]
+	public void MarketTimerRefusesToStartWithoutInterval()
+	{
+		var mock = CreateTimeProvider();
+
+		using var timer = new MarketTimer(mock.Object, () => { });
+
+		// Without an interval there is nothing to wait for, so starting is a programming error rather
+		// than a timer that silently never fires.
+		ThrowsExactly<InvalidOperationException>(() => { timer.Start(); });
+	}
+
+	[TestMethod]
+	public void MarketTimerCountsNoTimeWhileStoppedAndNoneAfterDispose()
+	{
+		var mock = CreateTimeProvider();
+
+		var fired = 0;
+		var timer = new MarketTimer(mock.Object, () => fired++).Interval(TimeSpan.FromSeconds(5)).Start();
+
+		mock.Raise(m => m.CurrentTimeChanged += null, TimeSpan.FromSeconds(5));
+		fired.AssertEqual(1);
+
+		// Time passing while the timer is stopped is not owed to anyone, and a restarted timer counts
+		// only from the restart: 5 more seconds of running time is exactly one more activation.
+		timer.Stop();
+		mock.Raise(m => m.CurrentTimeChanged += null, TimeSpan.FromSeconds(10));
+		fired.AssertEqual(1);
+
+		timer.Start();
+		mock.Raise(m => m.CurrentTimeChanged += null, TimeSpan.FromSeconds(5));
+		fired.AssertEqual(2);
+
+		timer.Dispose();
+		mock.Raise(m => m.CurrentTimeChanged += null, TimeSpan.FromSeconds(10));
+		fired.AssertEqual(2);
+	}
+
+	[TestMethod]
+	public void MarketTimerStopFromInsideCallbackTakesEffect()
+	{
+		var mock = CreateTimeProvider();
+
+		var fired = 0;
+		MarketTimer timer = null;
+		timer = new MarketTimer(mock.Object, () =>
+		{
+			fired++;
+			timer.Stop();
+		});
+
+		using (timer)
+		{
+			timer.Interval(TimeSpan.FromSeconds(5)).Start();
+
+			// A one-shot use stops itself from its own callback; the stop has to hold even though the
+			// callback runs while the timer is in the middle of servicing a tick.
+			mock.Raise(m => m.CurrentTimeChanged += null, TimeSpan.FromSeconds(5));
+			fired.AssertEqual(1);
+
+			mock.Raise(m => m.CurrentTimeChanged += null, TimeSpan.FromSeconds(5));
+			fired.AssertEqual(1);
+		}
+	}
+
 	[TestMethod]
 	public void OrderRules()
 	{

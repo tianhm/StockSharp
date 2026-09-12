@@ -512,4 +512,125 @@ public class SecurityAllSubscriptionTests : BaseTestClass
 	}
 
 	#endregion
+
+	#region Test 6: What may be replayed to a late subscriber
+
+	/// <summary>
+	/// An adapter that cannot filter by security - the case the ALL subscription exists for - and
+	/// that says nothing on its own, so the wrapper is driven message by message with no waiting.
+	/// </summary>
+	private sealed class NoSecurityFilterAdapter(IdGenerator transactionIdGenerator) : MessageAdapter(transactionIdGenerator)
+	{
+		public override bool IsSecurityRequired(DataType dataType) => false;
+
+		protected override ValueTask OnSendInMessageAsync(Message message, CancellationToken cancellationToken)
+			=> default;
+
+		public override IMessageAdapter Clone()
+			=> new NoSecurityFilterAdapter(TransactionIdGenerator);
+	}
+
+	/// <summary>
+	/// The cache the late subscriber is served from keeps the last message of any kind, so for ticks
+	/// it keeps a trade. A book is state and replaying it tells the subscriber where the market is;
+	/// a trade is an event that already happened, and replaying it presents a past trade as a new one.
+	/// Driven straight through the adapter, with no timing involved.
+	/// </summary>
+	[TestMethod]
+	public async Task LateTickSubscriber_IsNotGivenAlreadyHappenedTrade()
+	{
+		var inner = new NoSecurityFilterAdapter(new IncrementalIdGenerator());
+		using var adapter = new SubscriptionSecurityAllMessageAdapter(inner);
+
+		var output = new List<Message>();
+		adapter.NewOutMessageAsync += (m, ct) => { output.Add(m); return default; };
+
+		// the ALL subscription — the one that actually talks to the venue
+		await adapter.SendInMessageAsync(new MarketDataMessage
+		{
+			IsSubscribe = true,
+			TransactionId = 1,
+			DataType2 = DataType.Ticks,
+		}, CancellationToken);
+
+		var tick = new ExecutionMessage
+		{
+			DataTypeEx = DataType.Ticks,
+			SecurityId = AaplId,
+			TradePrice = 150m,
+			TradeVolume = 1m,
+			ServerTime = new DateTime(2024, 1, 1, 10, 0, 0, DateTimeKind.Utc),
+		};
+		tick.SetSubscriptionIds(subscriptionId: 1);
+
+		await inner.SendOutMessageAsync(tick, CancellationToken);
+
+		output.Clear();
+
+		// a per-security subscriber arrives after that trade has already happened
+		await adapter.SendInMessageAsync(new MarketDataMessage
+		{
+			IsSubscribe = true,
+			TransactionId = 2,
+			SecurityId = AaplId,
+			DataType2 = DataType.Ticks,
+		}, CancellationToken);
+
+		output.OfType<SubscriptionOnlineMessage>().Count(m => m.OriginalTransactionId == 2)
+			.AssertEqual(1, "the late subscriber joined the ALL subscription that is already open");
+
+		output.OfType<ExecutionMessage>().Count()
+			.AssertEqual(0, "a trade that happened before the subscription must not be delivered to it as a new one");
+	}
+
+	/// <summary>
+	/// An increment is a difference against a book the late subscriber has never seen, so replaying
+	/// one as its opening book leaves it with a book built out of nothing.
+	/// </summary>
+	[TestMethod]
+	public async Task LateDepthSubscriber_IsNotGivenBareIncrement()
+	{
+		var inner = new NoSecurityFilterAdapter(new IncrementalIdGenerator());
+		using var adapter = new SubscriptionSecurityAllMessageAdapter(inner);
+
+		var output = new List<Message>();
+		adapter.NewOutMessageAsync += (m, ct) => { output.Add(m); return default; };
+
+		await adapter.SendInMessageAsync(new MarketDataMessage
+		{
+			IsSubscribe = true,
+			TransactionId = 1,
+			DataType2 = DataType.MarketDepth,
+		}, CancellationToken);
+
+		var increment = new QuoteChangeMessage
+		{
+			SecurityId = AaplId,
+			ServerTime = new DateTime(2024, 1, 1, 10, 0, 0, DateTimeKind.Utc),
+			State = QuoteChangeStates.Increment,
+			Bids = [new(150m, 10)],
+			Asks = [],
+		};
+		increment.SetSubscriptionIds(subscriptionId: 1);
+
+		await inner.SendOutMessageAsync(increment, CancellationToken);
+
+		output.Clear();
+
+		await adapter.SendInMessageAsync(new MarketDataMessage
+		{
+			IsSubscribe = true,
+			TransactionId = 2,
+			SecurityId = AaplId,
+			DataType2 = DataType.MarketDepth,
+		}, CancellationToken);
+
+		output.OfType<SubscriptionOnlineMessage>().Count(m => m.OriginalTransactionId == 2)
+			.AssertEqual(1, "the late subscriber joined the ALL subscription that is already open");
+
+		output.OfType<QuoteChangeMessage>().Count(b => b.State == QuoteChangeStates.Increment)
+			.AssertEqual(0, "an increment is not a snapshot and cannot open a book for a subscriber that has none");
+	}
+
+	#endregion
 }

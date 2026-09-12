@@ -58,6 +58,10 @@ public class ConnectorMarketDataProtectionTests : BaseTestClass
 					{
 						await SendOutMessageAsync(mdMsg.CreateResponse(), cancellationToken);
 						LastSubscribedId = mdMsg.TransactionId;
+
+						// A live (non-historical) subscription reaches Online; Count/To based ones stay Active.
+						if (!mdMsg.IsHistoryOnly())
+							await SendOutMessageAsync(new SubscriptionOnlineMessage { OriginalTransactionId = mdMsg.TransactionId }, cancellationToken);
 					}
 					else
 					{
@@ -81,6 +85,24 @@ public class ConnectorMarketDataProtectionTests : BaseTestClass
 			msg.Add(Level1Fields.LastTradePrice, 42m);
 			msg.Add(Level1Fields.BestBidPrice, 41m);
 			msg.Add(Level1Fields.BestAskPrice, 43m);
+
+			if (subscriptionId != 0)
+				msg.OriginalTransactionId = subscriptionId;
+
+			await SendOutMessageAsync(msg, cancellationToken);
+		}
+
+		public async ValueTask SendLevel1(long subscriptionId, SecurityId secId, DateTime serverTime, IEnumerable<KeyValuePair<Level1Fields, object>> fields, CancellationToken cancellationToken)
+		{
+			var msg = new Level1ChangeMessage
+			{
+				SecurityId = secId,
+				ServerTime = serverTime,
+				LocalTime = serverTime,
+			};
+
+			foreach (var pair in fields)
+				msg.Add(pair.Key, pair.Value);
 
 			if (subscriptionId != 0)
 				msg.OriginalTransactionId = subscriptionId;
@@ -182,6 +204,19 @@ public class ConnectorMarketDataProtectionTests : BaseTestClass
 		return adapter.LastSubscribedId;
 	}
 
+	private static async Task<long> SubscribeOnlineAndWait(Connector connector, MockMarketDataAdapter adapter, DataType dataType, SecurityId secId, CancellationToken cancellationToken)
+	{
+		var sub = new Subscription(dataType, new Security { Id = secId.ToStringId() });
+
+		var online = AsyncHelper.CreateTaskCompletionSource<bool>();
+		connector.SubscriptionOnline += s => { if (ReferenceEquals(s, sub)) online.TrySetResult(true); };
+
+		_ = connector.SubscribeAsync(sub, cancellationToken).AsTask();
+		await online.Task.WithCancellation(cancellationToken);
+
+		return adapter.LastSubscribedId;
+	}
+
 	#endregion
 
 	#region Level1 — ValuesChanged
@@ -232,6 +267,57 @@ public class ConnectorMarketDataProtectionTests : BaseTestClass
 		await Task.Delay(500, CancellationToken);
 
 		valuesChangedCount.AssertEqual(0, "ValuesChanged should not fire for Count-based historical Level1 subscription");
+
+		runCts.Cancel();
+	}
+
+	[TestMethod]
+	[Timeout(10_000, CooperativeCancellation = true)]
+	public async Task Level1_AfterTicks_ValuesChangedCarriesFilteredChanges()
+	{
+		// Once ticks own the last-trade fields, the connector drops them from the Level1 snapshot.
+		// ValuesChanged must report that same filtered set, not the raw message.
+		var (connector, adapter) = CreateConnector();
+		var secId = Helper.CreateSecurityId();
+
+		await connector.ConnectAsync(CancellationToken);
+
+		using var runCts = CancellationTokenSource.CreateLinkedTokenSource(CancellationToken);
+
+		var tickSubId = await SubscribeOnlineAndWait(connector, adapter, DataType.Ticks, secId, runCts.Token);
+		var level1SubId = await SubscribeOnlineAndWait(connector, adapter, DataType.Level1, secId, runCts.Token);
+
+		await connector.GetSecurityAsync(secId, CancellationToken);
+
+		var tickRaised = AsyncHelper.CreateTaskCompletionSource<bool>();
+		var level1Raised = AsyncHelper.CreateTaskCompletionSource<IDictionary<Level1Fields, object>>();
+
+		connector.ValuesChanged += (sec, changes, serverTime, localTime) =>
+		{
+			var dict = changes.ToDictionary(p => p.Key, p => p.Value);
+
+			// OpenInterest is sent by the Level1 message only, so it tells the two sources apart.
+			if (dict.ContainsKey(Level1Fields.OpenInterest))
+				level1Raised.TrySetResult(dict);
+			else
+				tickRaised.TrySetResult(true);
+		};
+
+		await adapter.SendTick(tickSubId, secId, DateTime.UtcNow, CancellationToken);
+		await tickRaised.Task.WithCancellation(CancellationToken);
+
+		var fields = new Dictionary<Level1Fields, object>
+		{
+			{ Level1Fields.LastTradePrice, 50m },
+			{ Level1Fields.OpenInterest, 7m },
+		};
+
+		await adapter.SendLevel1(level1SubId, secId, DateTime.UtcNow, fields, CancellationToken);
+
+		var raised = await level1Raised.Task.WithCancellation(CancellationToken);
+
+		raised.ContainsKey(Level1Fields.OpenInterest).AssertTrue("neutral Level1 field must reach the subscriber");
+		raised.ContainsKey(Level1Fields.LastTradePrice).AssertFalse("last-trade field is owned by the tick stream and must be filtered out of ValuesChanged");
 
 		runCts.Cancel();
 	}
@@ -453,6 +539,150 @@ public class ConnectorMarketDataProtectionTests : BaseTestClass
 #pragma warning restore CS0618 // Type or member is obsolete
 
 		runCts.Cancel();
+	}
+
+	#endregion
+
+	#region Protection ends with the stream that claimed the fields
+
+	/// <summary>
+	/// A live order book is the better source of the best bid and ask, so while one is running the
+	/// connector lets it own those fields and ignores what Level1 says about them. That deal ends
+	/// with the book: once the user unsubscribes, Level1 is the only source left, and a best bid
+	/// frozen at the last price the book ever showed is not a stale number the user can spot - it
+	/// is presented as the current market, and orders are priced off it.
+	/// </summary>
+	[TestMethod]
+	[Timeout(10_000, CooperativeCancellation = true)]
+	public async Task Level1BestQuotesAreAcceptedAgainAfterTheOrderBookSubscriptionEnds()
+	{
+		var (connector, adapter) = CreateConnector();
+		var secId = Helper.CreateSecurityId();
+
+		await connector.ConnectAsync(CancellationToken);
+
+		using var level1Cts = CancellationTokenSource.CreateLinkedTokenSource(CancellationToken);
+		var level1SubId = await SubscribeOnlineAndWait(connector, adapter, DataType.Level1, secId, level1Cts.Token);
+
+		var security = await connector.GetSecurityAsync(secId, CancellationToken);
+
+		var bookTime = new DateTime(2026, 3, 1, 10, 0, 0, DateTimeKind.Utc);
+		var level1Time = bookTime.AddSeconds(1);
+
+		var bookApplied = AsyncHelper.CreateTaskCompletionSource<bool>();
+		var level1Applied = AsyncHelper.CreateTaskCompletionSource<bool>();
+
+		// Level1 values are only kept while somebody listens to this event. OpenInterest is sent by
+		// the Level1 message only, so it tells the two sources apart.
+		connector.ValuesChanged += (sec, changes, serverTime, localTime) =>
+		{
+			if (changes.Any(p => p.Key == Level1Fields.OpenInterest))
+				level1Applied.TrySetResult(true);
+			else
+				bookApplied.TrySetResult(true);
+		};
+
+		var bookSub = new Subscription(DataType.MarketDepth, new Security { Id = secId.ToStringId() });
+
+		var bookOnline = AsyncHelper.CreateTaskCompletionSource<bool>();
+		var bookStopped = AsyncHelper.CreateTaskCompletionSource<bool>();
+
+		connector.SubscriptionOnline += s => { if (ReferenceEquals(s, bookSub)) bookOnline.TrySetResult(true); };
+		connector.SubscriptionStopped += (s, e) => { if (ReferenceEquals(s, bookSub)) bookStopped.TrySetResult(true); };
+
+		connector.Subscribe(bookSub);
+		await bookOnline.Task.WithCancellation(CancellationToken);
+
+		await adapter.SendOrderBook(adapter.LastSubscribedId, secId, bookTime, CancellationToken);
+		await bookApplied.Task.WithCancellation(CancellationToken);
+
+		connector.GetSecurityValue(security, Level1Fields.BestBidPrice).AssertEqual((object)99m, "while the book is live it owns the best bid");
+
+		connector.UnSubscribe(bookSub);
+		await bookStopped.Task.WithCancellation(CancellationToken);
+
+		// OpenInterest belongs to neither stream, so this update is delivered whatever is done to
+		// the best quotes, and the assertions below report the quotes rather than time out.
+		await adapter.SendLevel1(level1SubId, secId, level1Time, new Dictionary<Level1Fields, object>
+		{
+			{ Level1Fields.BestBidPrice, 41m },
+			{ Level1Fields.BestAskPrice, 43m },
+			{ Level1Fields.OpenInterest, 7m },
+		}, CancellationToken);
+
+		await level1Applied.Task.WithCancellation(CancellationToken);
+
+		connector.GetSecurityValue(security, Level1Fields.BestBidPrice).AssertEqual((object)41m, "the book stream has ended, so the best bid must follow Level1 again");
+		connector.GetSecurityValue(security, Level1Fields.BestAskPrice).AssertEqual((object)43m, "the book stream has ended, so the best ask must follow Level1 again");
+
+		level1Cts.Cancel();
+	}
+
+	/// <summary>
+	/// The same deal for the last trade: while a tick stream is running it is the authority on the
+	/// last price, so the connector ignores the last-trade fields of Level1. When the user stops
+	/// the ticks, Level1 is again the only thing reporting the last price, and a last price stuck
+	/// at the final tick of a stream that ended hours ago is shown as the current one.
+	/// </summary>
+	[TestMethod]
+	[Timeout(10_000, CooperativeCancellation = true)]
+	public async Task Level1LastTradeIsAcceptedAgainAfterTheTickSubscriptionEnds()
+	{
+		var (connector, adapter) = CreateConnector();
+		var secId = Helper.CreateSecurityId();
+
+		await connector.ConnectAsync(CancellationToken);
+
+		using var level1Cts = CancellationTokenSource.CreateLinkedTokenSource(CancellationToken);
+		var level1SubId = await SubscribeOnlineAndWait(connector, adapter, DataType.Level1, secId, level1Cts.Token);
+
+		var security = await connector.GetSecurityAsync(secId, CancellationToken);
+
+		var tickTime = new DateTime(2026, 3, 1, 10, 0, 0, DateTimeKind.Utc);
+		var level1Time = tickTime.AddSeconds(1);
+
+		var tickApplied = AsyncHelper.CreateTaskCompletionSource<bool>();
+		var level1Applied = AsyncHelper.CreateTaskCompletionSource<bool>();
+
+		// OpenInterest is sent by the Level1 message only, so it tells the two sources apart.
+		connector.ValuesChanged += (sec, changes, serverTime, localTime) =>
+		{
+			if (changes.Any(p => p.Key == Level1Fields.OpenInterest))
+				level1Applied.TrySetResult(true);
+			else
+				tickApplied.TrySetResult(true);
+		};
+
+		var tickSub = new Subscription(DataType.Ticks, new Security { Id = secId.ToStringId() });
+
+		var tickOnline = AsyncHelper.CreateTaskCompletionSource<bool>();
+		var tickStopped = AsyncHelper.CreateTaskCompletionSource<bool>();
+
+		connector.SubscriptionOnline += s => { if (ReferenceEquals(s, tickSub)) tickOnline.TrySetResult(true); };
+		connector.SubscriptionStopped += (s, e) => { if (ReferenceEquals(s, tickSub)) tickStopped.TrySetResult(true); };
+
+		connector.Subscribe(tickSub);
+		await tickOnline.Task.WithCancellation(CancellationToken);
+
+		await adapter.SendTick(adapter.LastSubscribedId, secId, tickTime, CancellationToken);
+		await tickApplied.Task.WithCancellation(CancellationToken);
+
+		connector.GetSecurityValue(security, Level1Fields.LastTradePrice).AssertEqual((object)42m, "while the ticks are live they own the last price");
+
+		connector.UnSubscribe(tickSub);
+		await tickStopped.Task.WithCancellation(CancellationToken);
+
+		await adapter.SendLevel1(level1SubId, secId, level1Time, new Dictionary<Level1Fields, object>
+		{
+			{ Level1Fields.LastTradePrice, 50m },
+			{ Level1Fields.OpenInterest, 7m },
+		}, CancellationToken);
+
+		await level1Applied.Task.WithCancellation(CancellationToken);
+
+		connector.GetSecurityValue(security, Level1Fields.LastTradePrice).AssertEqual((object)50m, "the tick stream has ended, so the last price must follow Level1 again");
+
+		level1Cts.Cancel();
 	}
 
 	#endregion

@@ -589,8 +589,14 @@ public class AdapterRouterTests : BaseTestClass
 		AreEqual(1, result.Length);
 	}
 
+	/// <summary>
+	/// Asking which adapters can serve a subscription is a question, not an instruction. The request
+	/// belongs to the caller, who still holds it and goes on to send it; a probe that writes into it
+	/// decides on the caller's behalf how the data is to be built, and the caller never learns that
+	/// the request it is sending is no longer the one it wrote.
+	/// </summary>
 	[TestMethod]
-	public async Task GetSubscriptionAdapters_MarketDepth_BuildFromOrderLog()
+	public async Task ProbingAnAdapterLeavesTheCallersRequestAsItWasWritten()
 	{
 		var router = CreateRouter();
 
@@ -612,8 +618,50 @@ public class AdapterRouterTests : BaseTestClass
 
 		var result = await router.GetSubscriptionAdaptersAsync(mdMsg, [limitedAdapter], false, CancellationToken);
 
-		AreEqual(1, result.Length);
-		AreEqual(DataType.OrderLog, mdMsg.BuildFrom);
+		AreEqual(1, result.Length, "an adapter holding the order log can build the depth that was asked for");
+		IsNull(mdMsg.BuildFrom, "the caller asked for a depth without naming a source, and that is still what its request says");
+	}
+
+	/// <summary>
+	/// Two adapters can each build the depth the caller asked for, from different data: one from the
+	/// order log, the other from level1. Each is entitled to be judged on what it itself carries. If
+	/// probing the first one settles the source for the whole round, the second is measured against a
+	/// source it never had, and the caller silently ends up subscribed to one feed where two were
+	/// available.
+	/// </summary>
+	[TestMethod]
+	public async Task AnAdapterBuildingTheDepthFromLevel1IsNotLostBecauseAnotherWasProbedFirst()
+	{
+		var router = CreateRouter();
+
+		var idGen = new IncrementalIdGenerator();
+
+		var orderLogAdapter = new TestRouterAdapter(idGen);
+
+		foreach (var dt in await orderLogAdapter.GetSupportedMarketDataTypesAsync(default, null, null).ToArrayAsync(CancellationToken))
+			orderLogAdapter.RemoveSupportedMarketDataType(dt);
+
+		orderLogAdapter.AddSupportedMarketDataType(DataType.OrderLog);
+
+		var level1Adapter = new TestRouterAdapter(idGen);
+
+		foreach (var dt in await level1Adapter.GetSupportedMarketDataTypesAsync(default, null, null).ToArrayAsync(CancellationToken))
+			level1Adapter.RemoveSupportedMarketDataType(dt);
+
+		level1Adapter.AddSupportedMarketDataType(DataType.Level1);
+
+		var mdMsg = new MarketDataMessage
+		{
+			SecurityId = _secId1,
+			DataType2 = DataType.MarketDepth,
+			IsSubscribe = true,
+			TransactionId = 100,
+		};
+
+		var result = await router.GetSubscriptionAdaptersAsync(mdMsg, [orderLogAdapter, level1Adapter], false, CancellationToken);
+
+		AreEqual(2, result.Length, "both adapters can build the depth, each from the data it has");
+		Contains(result, level1Adapter, "the level1 adapter can build a depth and must not be judged against the order log the other one has");
 	}
 
 	#endregion

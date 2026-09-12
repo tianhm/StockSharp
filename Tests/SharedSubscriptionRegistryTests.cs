@@ -181,4 +181,25 @@ public class SharedSubscriptionRegistryTests : BaseTestClass
 		AreEqual(0, registry.Entries().Count);
 		IsFalse(registry.TryGetByHolder("a", out _));
 	}
+
+	/// <summary>
+	/// After the registry is cleared nobody holds anything, and that has to be true of the entries
+	/// callers are already holding as well as of the registry's own indexes. The payload is built on
+	/// the very dictionary the entry exposes, so a holder left behind there is a holder the fan-out
+	/// path still delivers to - for a subscription the registry has forgotten and will never give up.
+	/// </summary>
+	[TestMethod]
+	public void Clear_EmptiesHoldersOfEntriesAlreadyHandedOut()
+	{
+		var registry = CreateRegistry();
+
+		var entry = registry.Add("ticks", "a", "a", _ => 1L, out _);
+		registry.Add("ticks", "b", "b", _ => 1L, out _);
+
+		registry.Clear();
+
+		AreEqual(0, entry.Holders.Count, "a cleared registry leaves nobody holding the entries it handed out");
+		IsFalse(entry.Holders.ContainsKey("a"));
+		IsFalse(entry.Holders.ContainsKey("b"));
+	}
 }

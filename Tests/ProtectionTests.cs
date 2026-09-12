@@ -1,5 +1,6 @@
 ﻿namespace StockSharp.Tests;
 
+using StockSharp.Algo.PnL;
 using StockSharp.Algo.Strategies.Protective;
 
 [TestClass]
@@ -1354,5 +1355,129 @@ public class ProtectionTests : BaseTestClass
 		AreEqual(first, firstStop.Security, "a stop must be registered for the security it protects");
 		AreEqual(Sides.Sell, firstStop.Side);
 		AreEqual(10m, firstStop.Volume, "a stop closes the position of its own security, not the total");
+	}
+
+	/// <summary>
+	/// A protective level farther away than the price itself puts the trigger at or below zero -
+	/// a price that cannot be reached, so the position is simply unprotected. Standing in a price
+	/// of one tick for it instead lets that stop fire after all, closing the position for a penny
+	/// at a level the user never named.
+	/// </summary>
+	[TestMethod]
+	public void StopFartherAwayThanThePriceItselfDoesNotFireAtAPenny()
+	{
+		IProtectiveBehaviourFactory factory = new LocalProtectiveBehaviourFactory(0.01m, 2);
+
+		var behaviour = factory.Create(
+			new Unit(),                          // No take, so only the stop can fire
+			new Unit(200m, UnitTypes.Absolute),  // 200 below an entry of 100: no such price exists
+			false,                               // No trailing stop
+			TimeSpan.Zero,                       // No take timeout
+			TimeSpan.Zero,                       // No stop timeout
+			false);                              // No market orders
+
+		var time = new DateTime(2024, 1, 1, 10, 0, 0, DateTimeKind.Utc);
+
+		behaviour.Update(100m, 10m, time);
+
+		behaviour.TryActivate(0.01m, time)
+			.AssertNull("a stop placed below zero can never be reached, so nothing may fire at a penny instead");
+	}
+
+	/// <summary>
+	/// After part of a position is closed, protection and profit-and-loss must price what is left
+	/// the same way. They are two lot-matching models over one sequence of trades: if they pick
+	/// different lots to close, the take fires at a price the reported profit says the position
+	/// never cost, and a user reading one number cannot predict the other.
+	/// </summary>
+	[TestMethod]
+	public void ProtectionAndPnLAgreeOnThePositionPriceAfterAPartialClose()
+	{
+		var secId = new SecurityId { SecurityCode = "LOTS", BoardCode = "TEST" };
+		var time = new DateTime(2024, 1, 1, 10, 0, 0, DateTimeKind.Utc);
+
+		const decimal priceStep = 0.01m;
+
+		// One sequence of trades, fed to both models: two buys at different prices, then a sell
+		// closing part of the position - the point where lot matching starts to matter.
+		(decimal price, decimal volume)[] opens = [(100m, 10m), (110m, 5m)];
+		const decimal closeVolume = 5m;
+		const decimal closePrice = 120m;
+		const decimal leftVolume = 10m;
+
+		IProtectiveBehaviourFactory factory = new LocalProtectiveBehaviourFactory(priceStep, 2);
+
+		// Absolute take: it fires once the price is the offset away from the position price, so the
+		// price at which it fires is what protection believes the remaining position cost.
+		const decimal takeOffset = 10m;
+
+		var behaviour = factory.Create(
+			new Unit(takeOffset, UnitTypes.Absolute),
+			new Unit(),                       // No stop, so only the take can fire
+			false,                            // No trailing stop
+			TimeSpan.Zero,                    // No take timeout
+			TimeSpan.Zero,                    // No stop timeout
+			false);                           // No market orders
+
+		var queue = new PnLQueue(secId);
+
+		// One money unit per price step, so the reported profit is in price units.
+		queue.UpdateSecurity(new Level1ChangeMessage { SecurityId = secId }
+			.Add(Level1Fields.PriceStep, priceStep)
+			.Add(Level1Fields.StepPrice, priceStep));
+
+		var tradeId = 0L;
+
+		void Trade(Sides tradeSide, decimal tradePrice, decimal tradeVolume)
+		{
+			behaviour.Update(tradePrice, tradeSide == Sides.Buy ? tradeVolume : -tradeVolume, time);
+
+			queue.Process(new ExecutionMessage
+			{
+				DataTypeEx = DataType.Transactions,
+				SecurityId = secId,
+				TradeId = ++tradeId,
+				TradePrice = tradePrice,
+				TradeVolume = tradeVolume,
+				Side = tradeSide,
+				ServerTime = time,
+			});
+		}
+
+		foreach (var (openPrice, openVolume) in opens)
+			Trade(Sides.Buy, openPrice, openVolume);
+
+		Trade(Sides.Sell, closePrice, closeVolume);
+
+		behaviour.Position.AssertEqual(leftVolume, "both models are looking at the same open position");
+
+		// Mark the rest to a price well clear of every trade, so the unrealized profit names the
+		// price the queue still holds the position at.
+		const decimal markPrice = 130m;
+
+		queue.ProcessExecution(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Ticks,
+			SecurityId = secId,
+			TradePrice = markPrice,
+			ServerTime = time,
+		});
+
+		var pnlPosPrice = markPrice - queue.UnrealizedPnL / leftVolume;
+
+		// Protection must measure the take from that same price: not before it, and exactly at it.
+		behaviour.TryActivate(pnlPosPrice + takeOffset - priceStep, time)
+			.AssertNull("the take must not fire before the offset is reached from the position price the profit is measured against");
+
+		var activation = behaviour.TryActivate(pnlPosPrice + takeOffset, time);
+
+		activation.AssertNotNull($"the take must fire at {pnlPosPrice + takeOffset}, the offset away from the position price of {pnlPosPrice} the profit is measured against");
+
+		var (isTake, side, price, volume, condition) = activation.Value;
+		isTake.AssertTrue();
+		side.AssertEqual(Sides.Sell, "a take closing a long is a sell");
+		price.AssertEqual(pnlPosPrice + takeOffset);
+		volume.AssertEqual(leftVolume, "the take closes what is left of the position");
+		condition.AssertNull();
 	}
 }

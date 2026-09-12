@@ -433,6 +433,70 @@ public class BasketMessageAdapterTests : BasketTestBase
 			.AssertTrue("Subscription routing should have entry for transId");
 	}
 
+	[TestMethod]
+	[Timeout(10_000, CooperativeCancellation = true)]
+	public async Task OrderPendedWhileConnecting_AllAdaptersFail_IsAnsweredWithOrderFail()
+	{
+		// An order held while the adapters connect, and then left with no adapter at all, must be
+		// rejected by transaction the same way the immediate no-adapter path rejects it: without an
+		// OrderFail naming the transaction, the order stays pending for ever.
+		var token = CancellationToken;
+
+		var connectionState = new AdapterConnectionState();
+		var connectionManager = new AdapterConnectionManager(connectionState);
+		var subscriptionRouting = new SubscriptionRoutingState();
+		var parentChildMap = new ParentChildMap();
+		var pendingState = new PendingMessageState();
+		var orderRouting = new OrderRoutingState();
+
+		var (basket, adapter1, _) = CreateBasket(
+			connectionState: connectionState,
+			connectionManager: connectionManager,
+			subscriptionRouting: subscriptionRouting,
+			parentChildMap: parentChildMap,
+			pendingState: pendingState,
+			orderRouting: orderRouting,
+			twoAdapters: false);
+
+		adapter1.AutoRespond = false;
+
+		await SendToBasket(basket, new ConnectMessage(), token);
+
+		connectionState.HasPendingAdapters.AssertTrue("Adapter should be connecting");
+		connectionState.ConnectedCount.AssertEqual(0);
+
+		var transId = basket.TransactionIdGenerator.GetNextId();
+
+		await SendToBasket(basket, new OrderRegisterMessage
+		{
+			SecurityId = SecId1,
+			PortfolioName = Portfolio1,
+			Side = Sides.Buy,
+			Price = 100m,
+			Volume = 1m,
+			TransactionId = transId,
+		}, token);
+
+		pendingState.Count.AssertEqual(1, "Order sent while connecting should be held");
+		adapter1.GetMessages<OrderRegisterMessage>().Count()
+			.AssertEqual(0, "Connecting adapter should not receive the order");
+
+		// The only adapter fails, so the held order can never be routed anywhere.
+		await adapter1.SendOutMessageAsync(new ConnectMessage { Error = new InvalidOperationException("Connection refused") }, token);
+
+		connectionState.HasPendingAdapters.AssertFalse("No more pending adapters");
+		connectionState.ConnectedCount.AssertEqual(0, "Nothing connected");
+		pendingState.Count.AssertEqual(0, "Held messages should be released");
+
+		adapter1.GetMessages<OrderRegisterMessage>().Count()
+			.AssertEqual(0, "Failed adapter should not receive the order");
+
+		var fail = GetOut<ExecutionMessage>().FirstOrDefault(m => m.OriginalTransactionId == transId && m.HasOrderInfo);
+		fail.AssertNotNull("Order that no adapter can take must be answered with an OrderFail naming its transaction");
+		fail.OrderState.AssertEqual(OrderStates.Failed, "Order should be failed");
+		fail.Error.AssertNotNull("OrderFail should carry the reason");
+	}
+
 	#endregion
 
 	#region Pinned adapter data forwarding

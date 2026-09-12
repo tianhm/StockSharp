@@ -1,4 +1,4 @@
-namespace StockSharp.Tests;
+﻿namespace StockSharp.Tests;
 
 using System.Collections.Concurrent;
 using System.IO.Compression;
@@ -1446,6 +1446,121 @@ public class RemoteStorageClientTests : BaseTestClass
 		// Within the TTL but after an explicit clear -> must re-query the adapter.
 		await storageDrive.GetDatesAsync().ToListAsync(CancellationToken);
 		AreEqual(2, callCount, "ClearDatesCacheAsync must invalidate the cached dates so the next GetDatesAsync re-queries the adapter");
+	}
+
+	// A server whose day list follows the file commands it was actually sent, so a day that appears or
+	// disappears in a reply is the server's own state rather than the test's bookkeeping.
+	private static void ServeDatesFromFileCommands(MockRemoteAdapter adapter, params DateTime[] initial)
+	{
+		adapter.DataTypeLookupHandler = lookup =>
+		{
+			var dates = new HashSet<DateTime>(initial);
+
+			foreach (var cmd in adapter.SentMessages.OfType<RemoteFileCommandMessage>())
+			{
+				if (cmd.From is not DateTime from)
+					continue;
+
+				if (cmd.Command == CommandTypes.Update)
+					dates.Add(from.Date);
+				else if (cmd.Command == CommandTypes.Remove)
+					dates.Remove(from.Date);
+			}
+
+			return [new DataTypeInfoMessage { FileDataType = DataType.Ticks, Dates = [.. dates.OrderBy(d => d)] }];
+		};
+	}
+
+	// The days themselves, so a day that is missing or left over is visible in the failure.
+	private static string Days(IEnumerable<DateTime> dates)
+		=> dates.Select(d => d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)).JoinComma();
+
+	[TestMethod]
+	[Timeout(10000, CooperativeCancellation = true)]
+	public async Task StorageDrive_SaveStreamAsync_SavedDayIsInTheDatesRightAway()
+	{
+		var adapter = new MockRemoteAdapter(new IncrementalIdGenerator());
+
+		var secId = new SecurityId { SecurityCode = "AAPL", BoardCode = "NASDAQ" };
+		var day1 = new DateTime(2024, 1, 15);
+		var day2 = new DateTime(2024, 1, 16);
+
+		ServeDatesFromFileCommands(adapter, day1);
+
+		using var drive = new RemoteMarketDataDrive(RemoteMarketDataDrive.DefaultAddress, adapter);
+		var storageDrive = drive.GetStorageDrive(secId, DataType.Ticks, StorageFormats.Binary);
+
+		// Reading the days first is what fills the 3s cache, which is the state a writer finds the
+		// drive in whenever it checked what was there before deciding to write.
+		AreEqual("2024-01-15", Days(await storageDrive.GetDatesAsync().ToArrayAsync(CancellationToken)));
+
+		using var stream = new MemoryStream("day two"u8.ToArray());
+		await storageDrive.SaveStreamAsync(day2, stream, CancellationToken);
+
+		// What this same drive was told to save is part of what it reports: the local drive adds the
+		// day to its own list on save, and a caller reads these days to decide whether a day still has
+		// to be written.
+		AreEqual("2024-01-15,2024-01-16", Days(await storageDrive.GetDatesAsync().ToArrayAsync(CancellationToken)), "a day saved through the drive is in the days it reports");
+	}
+
+	[TestMethod]
+	[Timeout(10000, CooperativeCancellation = true)]
+	public async Task StorageDrive_DeleteAsync_DeletedDayIsOutOfTheDatesRightAway()
+	{
+		var adapter = new MockRemoteAdapter(new IncrementalIdGenerator());
+
+		var secId = new SecurityId { SecurityCode = "AAPL", BoardCode = "NASDAQ" };
+		var day1 = new DateTime(2024, 1, 15);
+		var day2 = new DateTime(2024, 1, 16);
+
+		ServeDatesFromFileCommands(adapter, day1, day2);
+
+		using var drive = new RemoteMarketDataDrive(RemoteMarketDataDrive.DefaultAddress, adapter);
+		var storageDrive = drive.GetStorageDrive(secId, DataType.Ticks, StorageFormats.Binary);
+
+		AreEqual("2024-01-15,2024-01-16", Days(await storageDrive.GetDatesAsync().ToArrayAsync(CancellationToken)));
+
+		await storageDrive.DeleteAsync(day2, CancellationToken);
+
+		// The other half of the same promise: a day this drive was told to delete is gone from what it
+		// reports, or a caller goes on to load a day it just removed.
+		AreEqual("2024-01-15", Days(await storageDrive.GetDatesAsync().ToArrayAsync(CancellationToken)), "a day deleted through the drive is out of the days it reports");
+	}
+
+	[TestMethod]
+	[Timeout(10000, CooperativeCancellation = true)]
+	public async Task StorageDrive_ClearDatesCacheAsync_DuringEnumeration_TheReaderStillGetsTheRest()
+	{
+		var adapter = new MockRemoteAdapter(new IncrementalIdGenerator());
+
+		var secId = new SecurityId { SecurityCode = "AAPL", BoardCode = "NASDAQ" };
+		var day1 = new DateTime(2024, 1, 15);
+		var day2 = new DateTime(2024, 1, 16);
+
+		ServeDatesFromFileCommands(adapter, day1, day2);
+
+		using var drive = new RemoteMarketDataDrive(RemoteMarketDataDrive.DefaultAddress, adapter);
+		var storageDrive = drive.GetStorageDrive(secId, DataType.Ticks, StorageFormats.Binary);
+
+		var enumerator = storageDrive.GetDatesAsync().GetAsyncEnumerator(CancellationToken);
+
+		try
+		{
+			IsTrue(await enumerator.MoveNextAsync());
+			AreEqual(day1, enumerator.Current);
+
+			// Cleared while a reader is half way through the days. The reader keeps the list it started
+			// on and finishes it, instead of failing on a cache dropped underneath it.
+			await storageDrive.ClearDatesCacheAsync(CancellationToken);
+
+			IsTrue(await enumerator.MoveNextAsync(), "an enumeration that began before the cache was cleared still delivers the rest of its days");
+			AreEqual(day2, enumerator.Current);
+			IsFalse(await enumerator.MoveNextAsync());
+		}
+		finally
+		{
+			await enumerator.DisposeAsync();
+		}
 	}
 
 	#endregion

@@ -589,4 +589,87 @@ public class SecurityNativeIdManagerTests : BaseTestClass
 		storedSecId.AssertNotNull();
 		storedSecId.Value.SecurityCode.AssertEqual("SYM2");
 	}
+
+	[TestMethod]
+	public async Task ProcessOutMessage_SuspendedQuoteIncrements_AreAllReleasedInOrder()
+	{
+		// An incremental book is only meaningful as the whole sequence, so increments held back while
+		// the native id is unknown must all be released, in arrival order, once it becomes known.
+		var token = CancellationToken;
+		var logReceiver = new TestReceiver();
+		var storageProvider = new MockNativeIdStorageProvider();
+
+		using var manager = new SecurityNativeIdManager(logReceiver, storageProvider, false);
+		await manager.InitializeAsync("TestAdapter", token);
+
+		var nativeId = "native_incr";
+
+		for (var i = 0; i < 3; i++)
+		{
+			var quotesMsg = new QuoteChangeMessage
+			{
+				SecurityId = new SecurityId { Native = nativeId },
+				ServerTime = DateTime.UtcNow,
+				State = QuoteChangeStates.Increment,
+				Bids = [new QuoteChange(100 + i, 1 + i)],
+			};
+
+			var (forward, extraOut, _) = await manager.ProcessOutMessageAsync(quotesMsg, token);
+
+			forward.AssertNull("Increment must be suspended while the native id is unknown");
+			extraOut.Length.AssertEqual(0);
+		}
+
+		var secMsg = new SecurityMessage
+		{
+			SecurityId = new SecurityId { SecurityCode = "SBER", BoardCode = "TQBR", Native = nativeId },
+		};
+
+		var (_, released, _) = await manager.ProcessOutMessageAsync(secMsg, token);
+
+		var books = released.OfType<QuoteChangeMessage>().ToArray();
+		books.Length.AssertEqual(3, "Every suspended increment must be released, not only the last one");
+
+		books[0].Bids[0].Price.AssertEqual(100m);
+		books[1].Bids[0].Price.AssertEqual(101m);
+		books[2].Bids[0].Price.AssertEqual(102m);
+
+		foreach (var book in books)
+		{
+			book.SecurityId.SecurityCode.AssertEqual("SBER");
+			book.SecurityId.BoardCode.AssertEqual("TQBR");
+		}
+	}
+
+	[TestMethod]
+	public async Task ProcessOutMessage_CodeWithoutBoard_ResolvesToTheOnlyKnownBoard()
+	{
+		// A message that names a code but no board is completed from the mapping table, matching the
+		// code case-insensitively, when exactly one known security carries that code.
+		var token = CancellationToken;
+		var logReceiver = new TestReceiver();
+		var storageProvider = new MockNativeIdStorageProvider();
+
+		var storage = storageProvider.GetStorage("TestAdapter");
+		await storage.TryAddAsync(new SecurityId { SecurityCode = "MSFT", BoardCode = "NASDAQ" }, "native_msft", cancellationToken: token);
+
+		using var manager = new SecurityNativeIdManager(logReceiver, storageProvider, false);
+		await manager.InitializeAsync("TestAdapter", token);
+
+		var level1Msg = new Level1ChangeMessage
+		{
+			SecurityId = new SecurityId { SecurityCode = "msft" },
+			ServerTime = DateTime.UtcNow,
+		};
+		level1Msg.Add(Level1Fields.LastTradePrice, 100m);
+
+		var (forward, extraOut, _) = await manager.ProcessOutMessageAsync(level1Msg, token);
+
+		forward.AssertNotNull();
+		extraOut.Length.AssertEqual(0);
+
+		var result = (Level1ChangeMessage)forward;
+		result.SecurityId.SecurityCode.AssertEqual("MSFT");
+		result.SecurityId.BoardCode.AssertEqual("NASDAQ");
+	}
 }

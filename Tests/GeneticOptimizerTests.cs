@@ -58,6 +58,42 @@ public class GeneticOptimizerTests : BaseTestClass
 		}
 	}
 
+	// Answers every draw at the bottom of the range it is offered, so a search that respects what
+	// the caller asked for lands on a value the test can state instead of one chance decides.
+	private sealed class LowestRandomProvider : IRandomProvider
+	{
+		int IRandomProvider.Next(int min, int max) => min;
+		long IRandomProvider.NextLong(long min, long max) => min;
+		double IRandomProvider.NextDouble() => 0d;
+		void IRandomProvider.NextBytes(byte[] buffer) => Array.Clear(buffer);
+	}
+
+	// Two extra parameters that change nothing the backtest does, so whatever comes back in them
+	// says only what the search chose to put there.
+	private sealed class TunableSmaStrategy : SmaStrategy
+	{
+		private readonly StrategyParam<decimal> _rate;
+		private readonly StrategyParam<bool> _flag;
+
+		public TunableSmaStrategy()
+		{
+			_rate = Param(nameof(Rate), 1.5m);
+			_flag = Param(nameof(Flag), true);
+		}
+
+		public decimal Rate
+		{
+			get => _rate.Value;
+			set => _rate.Value = value;
+		}
+
+		public bool Flag
+		{
+			get => _flag.Value;
+			set => _flag.Value = value;
+		}
+	}
+
 	private static Security CreateTestSecurity()
 		=> new() { Id = Paths.HistoryDefaultSecurity };
 
@@ -304,5 +340,101 @@ public class GeneticOptimizerTests : BaseTestClass
 
 		// The engine attempted compilation exactly once before failing.
 		provider.CompileCallCount.AssertEqual(1);
+	}
+
+	/// <summary>
+	/// Every value the search tries must be one the caller offered: for a decimal that is the
+	/// from + n*step grid inside [from, to] - also when from is not itself a multiple of the step -
+	/// and for a bool whose range names a single value it is that value. A result off the grid or
+	/// outside the range names a combination the user never asked for and, having no step of its
+	/// own, cannot be re-run by hand.
+	/// </summary>
+	[TestMethod]
+	[Timeout(120_000, CooperativeCancellation = true)]
+	public async Task GridIsHonouredForDecimalAndBoolParameters()
+	{
+		var security = CreateTestSecurity();
+		var portfolio = CreateTestPortfolio();
+
+		var secProvider = new CollectionSecurityProvider([security]);
+		var pfProvider = new CollectionPortfolioProvider([portfolio]);
+
+		using var optimizer = CreateHistoryOptimizer(new MockFitnessFormulaProvider(), secProvider, pfProvider);
+		optimizer.EmulationSettings.MaxIterations = 3;
+
+		var startTime = Paths.HistoryBeginDate;
+		var stopTime = Paths.HistoryBeginDate.AddDays(6);
+
+		var strategy = new TunableSmaStrategy
+		{
+			Security = security,
+			Portfolio = portfolio,
+			Volume = 1,
+			CandleType = TimeSpan.FromMinutes(1).TimeFrame(),
+			Long = 80,
+			Short = 30,
+
+			// Every draw lands at the bottom of its range, so the only value on offer for the
+			// decimal is its from, and the bool has but one value to begin with.
+			RandomProvider = new LowestRandomProvider(),
+		};
+
+		// from is not a multiple of the step, so a grid anchored anywhere but at from lands between
+		// the values the caller asked for, or below the range altogether.
+		const decimal rateFrom = 1.5m;
+		const decimal rateTo = 4.5m;
+		const decimal rateStep = 0.7m;
+
+		// A bool needs no step; naming the same value at both ends leaves the search one choice.
+		const bool flagOnly = true;
+
+		var geneticParams = new (IStrategyParam param, object from, object to, object step, IEnumerable values)[]
+		{
+			(strategy.Parameters[nameof(TunableSmaStrategy.Rate)], rateFrom, rateTo, rateStep, null),
+			(strategy.Parameters[nameof(TunableSmaStrategy.Flag)], flagOnly, flagOnly, null, null),
+		};
+
+		var violations = new List<string>();
+		var iterations = 0;
+
+		await foreach (var (_, parameters) in optimizer.RunAsync(startTime, stopTime, strategy, geneticParams, s => s.PnL, cancellationToken: CancellationToken))
+		{
+			iterations++;
+
+			foreach (var param in parameters)
+			{
+				switch (param.Id)
+				{
+					case nameof(TunableSmaStrategy.Rate):
+					{
+						var value = (decimal)param.Value;
+
+						if (value < rateFrom || value > rateTo)
+							violations.Add($"{param.Id}={value} is outside the requested range [{rateFrom}, {rateTo}]");
+						else if ((value - rateFrom) % rateStep != 0)
+							violations.Add($"{param.Id}={value} is not on the requested grid {rateFrom} + n*{rateStep}");
+
+						break;
+					}
+					case nameof(TunableSmaStrategy.Flag):
+					{
+						var value = (bool)param.Value;
+
+						if (value != flagOnly)
+							violations.Add($"{param.Id}={value} although only {flagOnly} was offered");
+
+						break;
+					}
+					default:
+						violations.Add($"Unexpected optimized parameter {param.Id}");
+						break;
+				}
+			}
+		}
+
+		IsTrue(iterations > 0, "Expected at least one evaluated iteration to check parameters of");
+
+		if (violations.Count > 0)
+			Fail(violations.Distinct().JoinN());
 	}
 }

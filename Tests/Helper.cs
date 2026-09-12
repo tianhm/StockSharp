@@ -787,6 +787,33 @@ static class Helper
 			posMsg.SecurityId.AssertNotEqual(default, "a position row must name the instrument it describes");
 	}
 
+	// Changes are the whole payload of a Level1/position message, so this is an equality check:
+	// the same set of keys and the same value under every key. A key on one side only fails, in
+	// every mode - a round-trip that drops a field or fills a default of its own is a defect, not
+	// a normalisation. The single difference the contract allows is the isMls one: a store that
+	// keeps time to the millisecond gets the expected DateTime truncated the same way first.
+	private static void CheckChangesEqual<TField>(IDictionary<TField, object> expected, IDictionary<TField, object> actual, bool isMls, string name)
+	{
+		expected.AssertNotNull($"{name}: expected changes are missing");
+		actual.AssertNotNull($"{name}: actual changes are missing");
+
+		var missing = expected.Keys.Where(k => !actual.ContainsKey(k)).ToArray();
+		var extra = actual.Keys.Where(k => !expected.ContainsKey(k)).ToArray();
+
+		missing.Length.AssertEqual(0, $"{name}: changes not found in actual: {missing.Select(k => k.ToString()).JoinCommaSpace()}");
+		extra.Length.AssertEqual(0, $"{name}: changes present in actual only: {extra.Select(k => k.ToString()).JoinCommaSpace()}");
+
+		foreach (var pair in expected)
+		{
+			var expectedValue = pair.Value;
+
+			if (expectedValue is DateTime dt)
+				expectedValue = dt.TruncateTime(isMls);
+
+			actual[pair.Key].AssertEqual(expectedValue, $"{name}: {pair.Key}");
+		}
+	}
+
 	public static void CheckEqual<T>(T expected, T actual, bool isMls = false, bool isSerializer = false, bool checkExtended = false, bool skipLocalTime = false, bool skipOriginalTransactionId = false)
 	{
 		if (expected.IsNull(true) && actual.IsNull(true))
@@ -982,33 +1009,7 @@ static class Helper
 			a.SeqNum.AssertEqual(e.SeqNum);
 			a.BuildFrom.AssertEqual(e.BuildFrom);
 
-			if (!isSerializer)
-			{
-				var d1 = e.Changes;
-				var d2 = a.Changes;
-
-				//d2.Count.AssertEqual(d1.Count);
-
-				var notFound = new HashSet<Level1Fields>();
-
-				foreach (var p1 in d1)
-				{
-					if (!d2.TryGetValue(p1.Key, out var value))
-					{
-						notFound.Add(p1.Key);
-						continue;
-					}
-
-					var expectedValue = p1.Value;
-
-					if (expectedValue is DateTime dto)
-						expectedValue = dto.TruncateTime(isMls);
-
-					value.AssertEqual(expectedValue);
-				}
-
-				notFound.Count.AssertEqual(0);
-			}
+			CheckChangesEqual(e.Changes, a.Changes, isMls, nameof(Level1ChangeMessage));
 		}
 		else if (type == typeof(PositionChangeMessage))
 		{
@@ -1031,28 +1032,7 @@ static class Helper
 			a.BuildFrom.AssertEqual(e.BuildFrom);
 			a.Side.AssertEqual(e.Side);
 
-			if (!isSerializer)
-			{
-				var d1 = e.Changes;
-				var d2 = a.Changes;
-
-				//d2.Count.AssertEqual(d1.Count);
-
-				var notFound = new HashSet<PositionChangeTypes>();
-
-				foreach (var p1 in d1)
-				{
-					if (!d2.TryGetValue(p1.Key, out var value))
-					{
-						notFound.Add(p1.Key);
-						continue;
-					}
-
-					value.AssertEqual(p1.Value);
-				}
-
-				notFound.Count.AssertEqual(0);
-			}
+			CheckChangesEqual(e.Changes, a.Changes, isMls, nameof(PositionChangeMessage));
 		}
 		else if (type == typeof(QuoteChangeMessage))
 		{

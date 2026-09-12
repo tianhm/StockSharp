@@ -790,6 +790,162 @@ public class MarketDataGeneratorTests : BaseTestClass
 		hasTradeInfo.AssertTrue();
 	}
 
+	// A source whose every draw is chosen by the test, so a generated fill is a decision and not a
+	// coin toss. An empty range is refused the way the real sources refuse it.
+	private class ScriptedRandomProvider(Func<int, int, int> next) : IRandomProvider
+	{
+		int IRandomProvider.Next(int min, int max)
+		{
+			if (min > max)
+				throw new ArgumentOutOfRangeException(nameof(min), min, $"Nothing can be drawn from the empty range [{min}, {max}].");
+
+			return next(min, max);
+		}
+
+		long IRandomProvider.NextLong(long min, long max) => min;
+		double IRandomProvider.NextDouble() => 0d;
+		void IRandomProvider.NextBytes(byte[] buffer) => throw new NotSupportedException();
+	}
+
+	// The draws OrderLogGenerator makes, told apart by the range each one asks for: (0, 5) picks the
+	// action and 5 is the one that matches a resting order, (1, N) sizes the fill. Side and price
+	// step are held still so only volume varies.
+	private static OrderLogGenerator CreateScriptedOrderLogGenerator(SecurityId secId, decimal volumeStep, int units, Func<int, int> fill)
+	{
+		var tradeGenerator = new RandomWalkTradeGenerator(secId)
+		{
+			Interval = TimeSpan.Zero,
+			MaxPriceStepCount = 1,
+			RandomProvider = new ScriptedRandomProvider((min, max) => min),
+		};
+
+		var generator = new OrderLogGenerator(secId, tradeGenerator)
+		{
+			Interval = TimeSpan.Zero,
+			MaxVolume = units,
+			MinVolume = units,
+			MaxPriceStepCount = 1,
+			RandomProvider = new ScriptedRandomProvider((min, max) =>
+			{
+				if (min == 1)
+					return fill(max);
+
+				return min == 0 && max == 5 ? 5 : 0;
+			}),
+		};
+
+		generator.Init();
+		generator.Process(CreateSecurityMessage(secId, volumeStep: volumeStep));
+
+		return generator;
+	}
+
+	[TestMethod]
+	public void OrderLogGenerator_MatchedTrade_FillsNeverExceedTheBalance()
+	{
+		// 25 volume steps of 0.1 make an order of 2.5. Each fill is a slice of what is left: above
+		// zero, no larger than the balance, and a whole number of steps. Taking as much as allowed
+		// each time walks the balance 2.5 -> 0.5, so the last fill owes exactly the 0.5 left, and
+		// the fills add up to 2.5 when the order goes Done.
+		const decimal volumeStep = 0.1m;
+		const decimal orderVolume = 2.5m;
+
+		var secId = CreateSecurityId();
+		var generator = CreateScriptedOrderLogGenerator(secId, volumeStep, 25, max => max);
+
+		var time = new DateTime(2026, 09, 09, 10, 00, 00, DateTimeKind.Utc);
+
+		var balance = orderVolume;
+		var filled = 0m;
+		var done = false;
+
+		for (var i = 0; i < 10 && !done; i++)
+		{
+			if (generator.Process(new TimeMessage { ServerTime = time.AddSeconds(i) }) is not ExecutionMessage exec || exec.TradeId is null)
+				continue;
+
+			var fill = exec.TradeVolume.Value;
+
+			IsGreater(fill, 0m, "a fill of nothing is not a trade");
+			IsLessOrEqual(fill, balance, $"filled {fill} while only {balance} was left");
+			AreEqual(0m, fill % volumeStep, $"{fill} is not a whole number of {volumeStep} steps");
+
+			balance -= fill;
+			filled += fill;
+
+			done = exec.OrderState == OrderStates.Done;
+
+			if (!done)
+				AreEqual(OrderStates.Active, exec.OrderState, "an order with volume left stays active");
+		}
+
+		IsTrue(done, "the order has to be filled out and closed");
+		AreEqual(orderVolume, filled, "the fills add up to the order volume");
+		AreEqual(0m, balance, "nothing is left of the order");
+	}
+
+	[TestMethod]
+	public void OrderLogGenerator_MatchedTrade_FillIsWholeVolumeSteps()
+	{
+		// 7 volume steps of 0.3 make an order of 2.1. What trades is a whole number of steps -
+		// 0.3, 0.6 ... 2.1 - because nothing smaller than a step is tradable, and neither is
+		// anything between two steps.
+		const decimal volumeStep = 0.3m;
+		const decimal orderVolume = 2.1m;
+
+		var secId = CreateSecurityId();
+		var generator = CreateScriptedOrderLogGenerator(secId, volumeStep, 7, max => max);
+
+		var time = new DateTime(2026, 09, 09, 10, 00, 00, DateTimeKind.Utc);
+
+		decimal? fill = null;
+
+		for (var i = 0; i < 10 && fill is null; i++)
+		{
+			if (generator.Process(new TimeMessage { ServerTime = time.AddSeconds(i) }) is ExecutionMessage exec && exec.TradeId != null)
+				fill = exec.TradeVolume.Value;
+		}
+
+		IsNotNull(fill, "a matched order log entry has to appear");
+		IsLessOrEqual(fill.Value, orderVolume, $"filled {fill} of an order of {orderVolume}");
+		AreEqual(0m, fill.Value % volumeStep, $"{fill} is not a whole number of {volumeStep} steps");
+	}
+
+	[TestMethod]
+	public void OrderLogGenerator_MatchedTrade_FillsAddUpToTheOrder()
+	{
+		// 3 volume steps of 1 make an order of 3, taken one step at a time: the balance walks
+		// 3 -> 2 -> 1 -> 0, so three fills of 1 arrive, the first two leaving the order active and
+		// the third closing it.
+		const decimal volumeStep = 1m;
+		const decimal orderVolume = 3m;
+
+		var secId = CreateSecurityId();
+		var generator = CreateScriptedOrderLogGenerator(secId, volumeStep, 3, max => 1);
+
+		var time = new DateTime(2026, 09, 09, 10, 00, 00, DateTimeKind.Utc);
+
+		var fills = new List<ExecutionMessage>();
+
+		for (var i = 0; i < 10 && !fills.Any(f => f.OrderState == OrderStates.Done); i++)
+		{
+			if (generator.Process(new TimeMessage { ServerTime = time.AddSeconds(i) }) is ExecutionMessage exec && exec.TradeId != null)
+				fills.Add(exec);
+		}
+
+		HasCount(3, fills, "one step per fill closes an order of three steps in three fills");
+
+		AreEqual(1m, fills[0].TradeVolume.Value);
+		AreEqual(1m, fills[1].TradeVolume.Value);
+		AreEqual(1m, fills[2].TradeVolume.Value);
+
+		AreEqual(OrderStates.Active, fills[0].OrderState);
+		AreEqual(OrderStates.Active, fills[1].OrderState);
+		AreEqual(OrderStates.Done, fills[2].OrderState, "the fill that takes the last step closes the order");
+
+		AreEqual(orderVolume, fills.Sum(f => f.TradeVolume.Value), "the fills add up to the order volume");
+	}
+
 	[TestMethod]
 	public void OrderLogGenerator_Clone_CreatesIndependentCopy()
 	{

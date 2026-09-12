@@ -869,6 +869,185 @@ public class CommissionTests
 	}
 
 	[TestMethod]
+	public void PerOrderCountRuleChargesOncePerOrderAcrossSeparateMessages()
+	{
+		// The emulator reports one order as several messages - registration, then a standalone
+		// trade, then a balance update, then the final state. One order is charged once.
+		var now = DateTime.UtcNow;
+
+		var rule = new CommissionOrderCountRule
+		{
+			Value = 10m,
+			Count = 1
+		};
+
+		var transId = 1L;
+		var orderId = 111L;
+
+		// Registration acknowledged.
+		rule.Process(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+			OriginalTransactionId = transId,
+			OrderId = orderId,
+			OrderPrice = 100m,
+			OrderVolume = 10m,
+			Balance = 10m,
+			OrderState = OrderStates.Active,
+			ServerTime = Inc(ref now)
+		}).AssertEqual(10m);
+
+		// Own trade delivered on its own, without order info.
+		rule.Process(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			OriginalTransactionId = transId,
+			OrderId = orderId,
+			TradeId = 1001L,
+			TradePrice = 100m,
+			TradeVolume = 4m,
+			ServerTime = Inc(ref now)
+		}).AssertNull("a trade is not a new order");
+
+		// Balance update for the very same order.
+		rule.Process(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+			OriginalTransactionId = transId,
+			OrderId = orderId,
+			OrderPrice = 100m,
+			OrderVolume = 10m,
+			Balance = 6m,
+			OrderState = OrderStates.Active,
+			ServerTime = Inc(ref now)
+		}).AssertNull("a balance update is not a new order");
+
+		// Final state of the very same order.
+		rule.Process(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+			OriginalTransactionId = transId,
+			OrderId = orderId,
+			OrderPrice = 100m,
+			OrderVolume = 10m,
+			Balance = 0m,
+			OrderState = OrderStates.Done,
+			ServerTime = Inc(ref now)
+		}).AssertNull("a final state is not a new order");
+	}
+
+	[TestMethod]
+	public void PerOrderCountRuleCountsOrdersNotNotifications()
+	{
+		// Two orders reported in interleaved messages: the charge lands on the second distinct
+		// order, not on the second message about the first one.
+		var now = DateTime.UtcNow;
+
+		var rule = new CommissionOrderCountRule
+		{
+			Value = 10m,
+			Count = 2
+		};
+
+		// First order registered.
+		rule.Process(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+			OriginalTransactionId = 1L,
+			OrderId = 111L,
+			OrderPrice = 100m,
+			OrderVolume = 10m,
+			Balance = 10m,
+			OrderState = OrderStates.Active,
+			ServerTime = Inc(ref now)
+		}).AssertNull();
+
+		// Balance update for the first order - still one order seen.
+		rule.Process(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+			OriginalTransactionId = 1L,
+			OrderId = 111L,
+			OrderPrice = 100m,
+			OrderVolume = 10m,
+			Balance = 4m,
+			OrderState = OrderStates.Active,
+			ServerTime = Inc(ref now)
+		}).AssertNull("a second message about the first order is not a second order");
+
+		// Second order registered - the second order completes the pair.
+		rule.Process(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+			OriginalTransactionId = 2L,
+			OrderId = 222L,
+			OrderPrice = 200m,
+			OrderVolume = 5m,
+			Balance = 5m,
+			OrderState = OrderStates.Active,
+			ServerTime = Inc(ref now)
+		}).AssertEqual(10m);
+
+		// Trades and final states of both orders bring no further orders.
+		rule.Process(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			OriginalTransactionId = 2L,
+			OrderId = 222L,
+			TradeId = 1002L,
+			TradePrice = 200m,
+			TradeVolume = 5m,
+			ServerTime = Inc(ref now)
+		}).AssertNull();
+
+		rule.Process(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+			OriginalTransactionId = 1L,
+			OrderId = 111L,
+			OrderPrice = 100m,
+			OrderVolume = 10m,
+			Balance = 0m,
+			OrderState = OrderStates.Done,
+			ServerTime = Inc(ref now)
+		}).AssertNull();
+
+		rule.Process(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+			OriginalTransactionId = 2L,
+			OrderId = 222L,
+			OrderPrice = 200m,
+			OrderVolume = 5m,
+			Balance = 0m,
+			OrderState = OrderStates.Done,
+			ServerTime = Inc(ref now)
+		}).AssertNull();
+
+		// A third distinct order starts the next pair.
+		rule.Process(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+			OriginalTransactionId = 3L,
+			OrderId = 333L,
+			OrderPrice = 300m,
+			OrderVolume = 1m,
+			Balance = 1m,
+			OrderState = OrderStates.Active,
+			ServerTime = Inc(ref now)
+		}).AssertNull();
+	}
+
+	[TestMethod]
 	public void PerOrderTradeTurnover()
 	{
 		var now = DateTime.UtcNow;
@@ -948,6 +1127,53 @@ public class CommissionTests
 		var orderMsg2 = CreateOrderMessage(50m, 10m, Inc(ref now));
 		result = rule.Process(orderMsg2);
 		result.AssertEqual(50m);
+	}
+
+	/// <summary>
+	/// A percent rule charges a share of the turnover, and a market order states no price, so until
+	/// it fills there is no turnover to take a share of. The rule's contract has a way to say that -
+	/// no value - and saying zero instead is a different statement altogether: it tells whoever asked
+	/// that this order costs nothing, and that answer is carried on as a fact. A trader reading the
+	/// order sees a commission of zero where the broker will take a real one, and a manager summing
+	/// the rules turns "not known" into "known to be nothing" for every other rule in the set.
+	/// </summary>
+	[TestMethod]
+	public void APercentRuleChargesNothingItCannotWorkOutOnAPricelessOrder()
+	{
+		var now = DateTime.UtcNow;
+
+		var rule = new CommissionOrderVolumeRule
+		{
+			Value = new Unit { Value = 5m, Type = UnitTypes.Percent }
+		};
+
+		// A market order at registration: volume is known, price is not, and nothing has traded yet.
+		var marketOrder = new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+			OrderType = OrderTypes.Market,
+			OrderPrice = 0m,
+			OrderVolume = 20m,
+			ServerTime = Inc(ref now)
+		};
+
+		rule.Process(marketOrder).AssertNull("a share of a turnover nobody knows yet is not zero, it is unknown");
+
+		// Once the order fills the turnover is known, and the same rule charges its share of it.
+		var filled = new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+			OrderType = OrderTypes.Market,
+			OrderPrice = 0m,
+			OrderVolume = 20m,
+			TradePrice = 110m,
+			TradeVolume = 20m,
+			ServerTime = Inc(ref now)
+		};
+
+		rule.Process(filled).AssertEqual(110m);
 	}
 
 	[TestMethod]

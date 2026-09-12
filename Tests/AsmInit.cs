@@ -12,6 +12,31 @@ using StockSharp.Algo.Compilation;
 [TestClass]
 public static class AsmInit
 {
+	// Shipped in the repository next to the Diagram.Core project. A run started from a copied output
+	// folder has no repository above it, and therefore no such file.
+	private const string _designerPythonExtensions = "../../../../Diagram.Core/python/designer_extensions.py";
+
+	/// <summary>
+	/// Why the scripting toolchain cannot be used on this machine, or <see langword="null"/> when it
+	/// can. A machine that cannot host the toolchain says nothing about whether StockSharp is
+	/// correct, so a test that needs it reports itself inconclusive with this reason instead of
+	/// failing: a suite that shows a missing dependency as red teaches its readers to ignore red.
+	/// </summary>
+	public static string ScriptingUnavailableReason { get; private set; }
+
+	/// <summary>
+	/// Why the sample history cannot be used on this machine, or <see langword="null"/> when it can.
+	/// The month of real market data every backtest replays arrives as the StockSharp.Samples.HistoryData
+	/// package rather than with the sources, so a machine that never restored it can say nothing about
+	/// whether the backtester is correct. A test that needs it reports itself inconclusive with this
+	/// reason: failing blames the product for an absent package, and returning quietly is worse still,
+	/// because the run is then counted as one that covered the backtest.
+	/// </summary>
+	public static string SampleHistoryUnavailableReason
+		=> Paths.HistoryDataPath is null
+			? "The StockSharp.Samples.HistoryData package was not found in the NuGet packages folder: this run has no sample history to replay."
+			: null;
+
 	[AssemblyInitialize]
 	public static async Task Init(TestContext _)
 	{
@@ -25,9 +50,21 @@ public static class AsmInit
 		// A diagram socket asks for a dispatcher as soon as an element is built; outside an
 		// app there is no UI thread to marshal to, and the dummy one runs callbacks inline.
 		ConfigManager.RegisterService<IDispatcher>(new DummyDispatcher());
-		await CompilationExtensions.Init(Paths.FileSystem, Helper.LogManager.Application, [("designer_extensions.py", File.ReadAllText("../../../../Diagram.Core/python/designer_extensions.py"))], default);
+
+		// The extensions are handed over only when they are on disk. Their absence disables the
+		// scripting tests, and it must not take the rest of the assembly with it - which is exactly
+		// what an exception out of an assembly initializer does to every test in the run.
+		var extraPythonCommon = new List<(string name, string body)>();
+
+		if (File.Exists(_designerPythonExtensions))
+			extraPythonCommon.Add(("designer_extensions.py", File.ReadAllText(_designerPythonExtensions)));
+		else
+			ScriptingUnavailableReason = $"The designer's Python extensions were not found at '{_designerPythonExtensions}': this run has no repository to take scripts from.";
+
+		await CompilationExtensions.Init(Paths.FileSystem, Helper.LogManager.Application, extraPythonCommon, default);
 
 		ConfigManager.RegisterService<IDatabaseProvider>(new AdoDatabaseProvider());
+
 		SqlServerDialect.Register(SqlClientFactory.Instance);
 
 		Helper.FileSystem.ClearTemp();

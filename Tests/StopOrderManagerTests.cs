@@ -1,4 +1,4 @@
-namespace StockSharp.Tests;
+﻿namespace StockSharp.Tests;
 
 [TestClass]
 public class StopOrderManagerTests : BaseTestClass
@@ -637,5 +637,119 @@ public class StopOrderManagerTests : BaseTestClass
 
 		triggers = mgr.CheckPrice(secId, 84, DateTime.UtcNow);
 		Assert.AreEqual(1, triggers.Count);
+	}
+
+	/// <summary>
+	/// Registers a conditional order through the engine's own registration path, the way a client order
+	/// arrives, so the condition is translated by the engine rather than by the test.
+	/// </summary>
+	private static MatchingEngineAdapter RegisterStop(SecurityId secId, Sides side, OrderCondition condition)
+	{
+		var engine = new MatchingEngineAdapter();
+
+		engine.ProcessOrderRegister(new()
+		{
+			TransactionId = 1,
+			SecurityId = secId,
+			PortfolioName = "test",
+			Side = side,
+			OrderType = OrderTypes.Conditional,
+			Volume = 10,
+			LocalTime = DateTime.UtcNow,
+			Condition = condition,
+		}, []);
+
+		return engine;
+	}
+
+	[TestMethod]
+	public void RegisteredPercentClosePrice_ResolvedAgainstActivationPrice()
+	{
+		// A percent close price registered on the condition must still be a percent once the stop fires.
+		// ClosePositionPrice is a percent of the activation price, and a buy stop pays up:
+		// 100 * (1 + 2/100) = 102.
+		var secId = CreateSecId();
+
+		var engine = RegisterStop(secId, Sides.Buy, new StopOrderCondition()
+		{
+			ActivationPrice = 100m,
+			ClosePositionPrice = 2m,
+			IsClosePositionPricePercent = true,
+		});
+
+		var triggers = engine.StopOrderManager.CheckPrice(secId, 100m, DateTime.UtcNow);
+
+		AreEqual(1, triggers.Count, "a buy stop at 100 must fire when the market reaches 100");
+		AreEqual<OrderTypes?>(OrderTypes.Limit, triggers[0].ResultingOrder.OrderType, "a stop naming a close price places a limit order");
+		AreEqual(102m, triggers[0].ResultingOrder.Price, "a 2 percent close price on a buy stop at 100 is 102, not 2");
+	}
+
+	[TestMethod]
+	public void RegisteredPercentTrailingOffset_TrailsByPercentOfWatermark()
+	{
+		// A percent trailing offset registered on the condition must still be a percent once the stop
+		// trails. A sell trailing 5 percent below a high of 120 rests at 120 * (1 - 5/100) = 114,
+		// so 114.9 is still above it and must not fire.
+		var secId = CreateSecId();
+
+		var engine = RegisterStop(secId, Sides.Sell, new StopOrderCondition()
+		{
+			ActivationPrice = 100m,
+			IsTrailing = true,
+			TrailingOffset = 5m,
+			IsTrailingOffsetPercent = true,
+		});
+
+		var mgr = engine.StopOrderManager;
+
+		AreEqual(0, mgr.CheckPrice(secId, 120m, DateTime.UtcNow).Count, "a rising market moves a trailing sell up, it does not fire it");
+		AreEqual(0, mgr.CheckPrice(secId, 114.9m, DateTime.UtcNow).Count, "114.9 has not reached a stop trailing 5 percent below 120");
+
+		var triggers = mgr.CheckPrice(secId, 114m, DateTime.UtcNow);
+
+		AreEqual(1, triggers.Count, "the market reached the trailed stop");
+		AreEqual(114m, triggers[0].Info.StopPrice, "a 5 percent trail below a high of 120 rests at 114");
+	}
+
+	[TestMethod]
+	public void RegisteredTakeProfitSell_FiresWhenTheMarketRisesToIt()
+	{
+		// A condition that names a take-profit price and no stop-loss price is a take-profit: a sell
+		// take at 110 waits while the market is below it and fires when it reaches 110. Read as a
+		// stop-loss it carries no activation price at all, rests at 0 and can never fire.
+		var secId = CreateSecId();
+
+		var condition = new EmulationOrderCondition();
+		((ITakeProfitOrderCondition)condition).ActivationPrice = 110m;
+
+		var mgr = RegisterStop(secId, Sides.Sell, condition).StopOrderManager;
+
+		AreEqual(0, mgr.CheckPrice(secId, 105m, DateTime.UtcNow).Count, "105 has not reached a take-profit asking for 110");
+
+		var triggers = mgr.CheckPrice(secId, 110m, DateTime.UtcNow);
+
+		AreEqual(1, triggers.Count, "a sell take-profit at 110 must fire when the market reaches 110");
+		AreEqual(110m, triggers[0].Info.StopPrice, "and fire at the price it named, not at 0");
+	}
+
+	[TestMethod]
+	public void RegisteredTakeProfitBuy_DoesNotFireBeforeTheMarketFallsToIt()
+	{
+		// The other side of the same rule: a buy take-profit at 90 waits for the market to fall to 90.
+		// Read as a stop-loss with no activation price it sits at 0, which every price is above, so it
+		// fires on the first quote it sees and buys the market it was meant to wait out.
+		var secId = CreateSecId();
+
+		var condition = new EmulationOrderCondition();
+		((ITakeProfitOrderCondition)condition).ActivationPrice = 90m;
+
+		var mgr = RegisterStop(secId, Sides.Buy, condition).StopOrderManager;
+
+		AreEqual(0, mgr.CheckPrice(secId, 100m, DateTime.UtcNow).Count, "100 is above a buy take-profit waiting for 90, so nothing may fire");
+
+		var triggers = mgr.CheckPrice(secId, 90m, DateTime.UtcNow);
+
+		AreEqual(1, triggers.Count, "a buy take-profit at 90 must fire when the market falls to 90");
+		AreEqual(90m, triggers[0].Info.StopPrice, "and fire at the price it named, not at 0");
 	}
 }

@@ -6,6 +6,10 @@ using StockSharp.Algo.Statistics;
 [TestClass]
 public class StatisticsTests : BaseTestClass
 {
+	// A book that loses a fifth of itself every period: every period is a downside one, so the downside
+	// deviation is the same number whether it is averaged over the losing periods or over all of them.
+	private static readonly decimal[] _allDownPnL = [100m, 80m, 64m, 51.2m, 40.96m];
+
 	[TestMethod]
 	public void NetProfit()
 	{
@@ -1180,20 +1184,174 @@ public class StatisticsTests : BaseTestClass
 		(parameter.Value < 0).AssertTrue();
 	}
 
+	/// <summary>
+	/// A user is entitled to assume that an equity curve which gained in every single period scores above one
+	/// that never moved. Zero is what a book with no return and no risk earns; having no losing period at all
+	/// is the best downside record there is, not a missing one. It matters wherever strategies are ranked by
+	/// this figure - answering zero buries the cleanest runs among the ones that did nothing.
+	/// </summary>
 	[TestMethod]
-	public void SortinoRatio_NoDownsideReturnsZero()
+	public void SortinoRatio_NoDownsideScoresAboveAFlatCurve()
 	{
-		var parameter = new SortinoRatioParameter();
-		var t = DateTime.UtcNow;
+		var t = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
-		// PnL: 0.0 → 0.1 → 0.3 → 0.6, returns: +0.1, +0.2, +0.3 (все возвраты положительные)
-		parameter.Add(t, 0.0m, null);
-		parameter.Add(t, 0.1m, null);
-		parameter.Add(t, 0.3m, null);
-		parameter.Add(t, 0.6m, null);
+		var flat = new SortinoRatioParameter { RiskFreeRate = 0m };
+		var rising = new SortinoRatioParameter { RiskFreeRate = 0m };
 
-		// Downside deviation = 0, коэффициент = 0 (по текущей реализации)
-		parameter.Value.AssertEqual(0);
+		// PnL 0.0 -> 0.1 -> 0.3 -> 0.6: every period gained and none lost. The flat book is held at the
+		// same level the rising one ends on, so the two differ in what happened, not in where they sit.
+		decimal[] risingPnL = [0.0m, 0.1m, 0.3m, 0.6m];
+
+		for (var i = 0; i < risingPnL.Length; i++)
+		{
+			flat.Add(t.AddDays(i), 0.6m, null);
+			rising.Add(t.AddDays(i), risingPnL[i], null);
+		}
+
+		// A book that never moved has no return and no risk to report, so it scores zero.
+		flat.Value.AssertEqual(0m);
+
+		(rising.Value > flat.Value).AssertTrue("an equity curve that gained in every period must score above one that never moved");
+	}
+
+	[TestMethod]
+	public void SharpeRatio_AnnualizedValueFromDefinition()
+	{
+		var parameter = new SharpeRatioParameter { RiskFreeRate = 0m };
+		var t = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+		// Daily cumulative PnL earned on 100000 of capital: five daily gains of +10, -5, +10, -5, +10.
+		decimal[] pnl = [100000m, 100010m, 100005m, 100015m, 100010m, 100020m];
+
+		for (var i = 0; i < pnl.Length; i++)
+			parameter.Add(t.AddDays(i), pnl[i], null);
+
+		// Sharpe = (mean return - rf) / stdev, annualized as mean * P and stdev * sqrt(P), P = 365.25 days.
+		// With rf = 0 the capital base cancels out of the quotient, so only the shape of the gains matters:
+		// mean = 20/5 = 4, sample stdev = sqrt((36+81+36+81+36)/4) = sqrt(67.5) = 8.2158384,
+		// 4 / 8.2158384 = 0.4868645, times sqrt(365.25) = 19.1115149 gives 9.30472.
+		((double)parameter.Value).AssertEqual(9.30472, 0.02);
+	}
+
+	[TestMethod]
+	public void SharpeRatio_DoesNotDependOnPnLLevel()
+	{
+		var parameter = new SharpeRatioParameter { RiskFreeRate = 0m };
+		var t = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+		// The same daily gains of +10, -5, +10, -5, +10 on the same 100000 of capital, reported as
+		// cumulative PnL from a fresh start instead of from a book that was already up 100000.
+		decimal[] pnl = [0m, 10m, 5m, 15m, 10m, 20m];
+
+		for (var i = 0; i < pnl.Length; i++)
+			parameter.Add(t.AddDays(i), pnl[i], null);
+
+		// Same capital, same gains, same days, so the same figure as SharpeRatio_AnnualizedValueFromDefinition:
+		// 4 / 8.2158384 * sqrt(365.25) = 9.30472. Where the curve happens to sit relative to zero is not
+		// part of the definition of a return.
+		((double)parameter.Value).AssertEqual(9.30472, 0.02);
+	}
+
+	[TestMethod]
+	public void SharpeRatio_AnnualizationFollowsPeriod()
+	{
+		var parameter = new SharpeRatioParameter { RiskFreeRate = 0m, Period = TimeSpan.FromDays(7) };
+		var t = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+		// The same +10, -5, +10, -5, +10 gains on 100000 of capital, observed weekly instead of daily.
+		decimal[] pnl = [100000m, 100010m, 100005m, 100015m, 100010m, 100020m];
+
+		for (var i = 0; i < pnl.Length; i++)
+			parameter.Add(t.AddDays(7 * i), pnl[i], null);
+
+		// A weekly period is P = 365.25/7 = 52.178571 periods a year, and the ratio scales with sqrt(P):
+		// 0.4868645 * sqrt(52.178571) = 0.4868645 * 7.2234736 = 3.51685, the daily figure over sqrt(7).
+		((double)parameter.Value).AssertEqual(3.51685, 0.02);
+	}
+
+	[TestMethod]
+	public void SortinoRatio_DownsideDeviationAveragesOverAllPeriods()
+	{
+		var parameter = new SortinoRatioParameter { RiskFreeRate = 0m };
+		var t = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+		// Daily cumulative PnL earned on 100000 of capital: five daily gains of +10, -5, +10, -5, +10.
+		decimal[] pnl = [100000m, 100010m, 100005m, 100015m, 100010m, 100020m];
+
+		for (var i = 0; i < pnl.Length; i++)
+			parameter.Add(t.AddDays(i), pnl[i], null);
+
+		// Downside deviation takes the shortfall below the target in every period - zero in a winning one -
+		// and averages the squares over all periods, not over the losing ones: sqrt((5^2 + 5^2)/5) = sqrt(10)
+		// = 3.1622777. With rf = 0 the capital base cancels: 4 / 3.1622777 = 1.2649111, times sqrt(365.25)
+		// = 19.1115149 gives 24.17437.
+		((double)parameter.Value).AssertEqual(24.17437, 0.05);
+	}
+
+	[TestMethod]
+	public void SortinoRatio_NoDownsideIsNotTheSameAsNoMovement()
+	{
+		var t = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+		var flat = new SortinoRatioParameter { RiskFreeRate = 0m };
+		var rising = new SortinoRatioParameter { RiskFreeRate = 0m };
+
+		decimal[] flatPnL = [100000m, 100000m, 100000m, 100000m, 100000m];
+		decimal[] risingPnL = [100000m, 100010m, 100020m, 100030m, 100040m];
+
+		for (var i = 0; i < flatPnL.Length; i++)
+		{
+			flat.Add(t.AddDays(i), flatPnL[i], null);
+			rising.Add(t.AddDays(i), risingPnL[i], null);
+		}
+
+		// A book that never moved has no return and no risk to report, so it scores zero.
+		flat.Value.AssertEqual(0m);
+
+		// A book that only ever gained has a positive return and no downside; whichever number is chosen
+		// to stand for "no downside", it cannot be the one that already means "nothing happened".
+		(rising.Value != flat.Value).AssertTrue("a strictly rising equity must not score the same Sortino as a flat one");
+	}
+
+	[TestMethod]
+	public void SortinoRatio_RiskFreeRateComesOffTheAnnualizedReturn()
+	{
+		var t = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+		var noRate = new SortinoRatioParameter { RiskFreeRate = 0m };
+		var withRate = new SortinoRatioParameter { RiskFreeRate = 0.5m };
+
+		for (var i = 0; i < _allDownPnL.Length; i++)
+		{
+			noRate.Add(t.AddDays(i), _allDownPnL[i], null);
+			withRate.Add(t.AddDays(i), _allDownPnL[i], null);
+		}
+
+		// Each day gives back a fifth of the book, so all four returns are exactly -0.2: mean = -0.2 and
+		// downside deviation = sqrt(4 * 0.04 / 4) = 0.2. Over P = 365.25 daily periods the return
+		// annualizes to -73.05 and the risk to 0.2 * sqrt(365.25) = 3.8223030, so with no risk-free rate
+		// the ratio is -73.05 / 3.8223030 = -19.111515, which is -sqrt(365.25).
+		((double)noRate.Value).AssertEqual(-19.111515, 0.0001);
+
+		// The risk-free rate is an annual rate: it comes off the annualized return once, and off nothing
+		// else - not each period's return, not the downside deviation.
+		// (-73.05 - 0.5) / 3.8223030 = -19.242326.
+		((double)withRate.Value).AssertEqual(-19.242326, 0.0001);
+	}
+
+	[TestMethod]
+	public void SortinoRatio_AnnualizationFollowsPeriod()
+	{
+		var parameter = new SortinoRatioParameter { RiskFreeRate = 0m, Period = TimeSpan.FromDays(7) };
+		var t = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+		for (var i = 0; i < _allDownPnL.Length; i++)
+			parameter.Add(t.AddDays(7 * i), _allDownPnL[i], null);
+
+		// The same -0.2 per period, now observed weekly: P = 365.25/7 = 52.178571 periods a year. The
+		// return scales with P and the risk with sqrt(P), so the ratio scales with sqrt(P):
+		// -0.2 / 0.2 * sqrt(52.178571) = -7.2234736, the daily figure divided by sqrt(7).
+		((double)parameter.Value).AssertEqual(-7.2234736, 0.0001);
 	}
 
 	[TestMethod]

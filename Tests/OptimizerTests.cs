@@ -27,6 +27,50 @@ public class OptimizerTests : BaseTestClass
 		}
 	}
 
+	// A source whose draws are decided in advance: every range is asked for the same fraction of itself,
+	// so a generated parameter set is a fact the test can state rather than a sample it has to survey.
+	private sealed class FixedFractionRandomProvider(double fraction) : IRandomProvider
+	{
+		int IRandomProvider.Next(int min, int max) => min + (int)((max - min) * fraction);
+		long IRandomProvider.NextLong(long min, long max) => min + (long)((max - min) * fraction);
+		double IRandomProvider.NextDouble() => fraction;
+		void IRandomProvider.NextBytes(byte[] buffer) => throw new NotSupportedException();
+	}
+
+	// The SMA strategy plus one parameter of each remaining type the genetic search generates values
+	// for. The strategy itself never reads them - only the values it is handed back are under test.
+	private sealed class TypedParamsStrategy : SmaStrategy
+	{
+		private readonly StrategyParam<decimal> _decimalParam;
+		private readonly StrategyParam<double> _doubleParam;
+		private readonly StrategyParam<TimeSpan> _timeSpanParam;
+
+		public TypedParamsStrategy()
+		{
+			_decimalParam = Param(nameof(DecimalParam), 10m);
+			_doubleParam = Param(nameof(DoubleParam), 10d);
+			_timeSpanParam = Param(nameof(TimeSpanParam), TimeSpan.FromMinutes(10));
+		}
+
+		public decimal DecimalParam
+		{
+			get => _decimalParam.Value;
+			set => _decimalParam.Value = value;
+		}
+
+		public double DoubleParam
+		{
+			get => _doubleParam.Value;
+			set => _doubleParam.Value = value;
+		}
+
+		public TimeSpan TimeSpanParam
+		{
+			get => _timeSpanParam.Value;
+			set => _timeSpanParam.Value = value;
+		}
+	}
+
 	private static Security CreateTestSecurity()
 	{
 		return new() { Id = Paths.HistoryDefaultSecurity };
@@ -613,6 +657,302 @@ public class OptimizerTests : BaseTestClass
 		}
 
 		IsTrue(results.Count > 0, "Expected at least one result from genetic optimizer");
+	}
+
+	/// <summary>
+	/// A value the search hands back must be one the caller could have asked for: inside the range,
+	/// on the from + n*step grid, and, where a set of values was given, one of that set.
+	/// </summary>
+	[TestMethod]
+	public async Task GeneticRunAsyncChoosesParametersTheCallerAskedFor()
+	{
+		var security = CreateTestSecurity();
+		var portfolio = CreateTestPortfolio();
+
+		var secProvider = new CollectionSecurityProvider([security]);
+		var pfProvider = new CollectionPortfolioProvider([portfolio]);
+		var storageRegistry = GetHistoryStorage();
+
+		using var optimizer = new GeneticOptimizer(secProvider, pfProvider, storageRegistry, Paths.FileSystem);
+
+		var startTime = Paths.HistoryBeginDate;
+		var stopTime = Paths.HistoryBeginDate.AddDays(6);
+
+		var strategy = new SmaStrategy
+		{
+			Security = security,
+			Portfolio = portfolio,
+			Volume = 1,
+			CandleType = TimeSpan.FromMinutes(1).TimeFrame(),
+			Long = 21,
+			Short = 5,
+		};
+
+		var shortParam = strategy.Parameters[nameof(SmaStrategy.Short)];
+		var longParam = strategy.Parameters[nameof(SmaStrategy.Long)];
+		var stopParam = strategy.Parameters[nameof(SmaStrategy.StopValue)];
+
+		// Neither range starts on a multiple of its step, so a grid anchored anywhere but at from
+		// lands between the steps the caller asked for, or outside the range altogether.
+		const int shortFrom = 5;
+		const int shortTo = 11;
+		const int shortStep = 4;
+
+		const int longFrom = 21;
+		const int longTo = 45;
+		const int longStep = 8;
+
+		var stopValues = new[] { new Unit(1, UnitTypes.Percent), new Unit(3, UnitTypes.Percent) };
+
+		optimizer.EmulationSettings.MaxIterations = 5;
+
+		var geneticParams = new (IStrategyParam param, object from, object to, object step, IEnumerable values)[]
+		{
+			(shortParam, shortFrom, shortTo, shortStep, null),
+			(longParam, longFrom, longTo, longStep, null),
+			(stopParam, null, null, null, stopValues),
+		};
+
+		static void CheckGrid(IStrategyParam param, int from, int to, int step, List<string> violations)
+		{
+			var value = (int)param.Value;
+
+			if (value < from || value > to)
+				violations.Add($"{param.Id}={value} is outside the requested range [{from}, {to}]");
+			else if ((value - from) % step != 0)
+				violations.Add($"{param.Id}={value} is not on the requested grid {from} + n*{step}");
+		}
+
+		var violations = new List<string>();
+		var iterations = 0;
+
+		await foreach (var (_, parameters) in optimizer.RunAsync(startTime, stopTime, strategy, geneticParams, s => s.PnL, cancellationToken: CancellationToken))
+		{
+			iterations++;
+
+			foreach (var param in parameters)
+			{
+				switch (param.Id)
+				{
+					case nameof(SmaStrategy.Short):
+						CheckGrid(param, shortFrom, shortTo, shortStep, violations);
+						break;
+
+					case nameof(SmaStrategy.Long):
+						CheckGrid(param, longFrom, longTo, longStep, violations);
+						break;
+
+					case nameof(SmaStrategy.StopValue):
+						if (!stopValues.Contains((Unit)param.Value))
+							violations.Add($"{param.Id}={param.Value} is none of the given values");
+
+						break;
+
+					default:
+						violations.Add($"Unexpected optimized parameter {param.Id}");
+						break;
+				}
+			}
+		}
+
+		IsTrue(iterations > 0, "Expected at least one evaluated iteration to check parameters of");
+
+		if (violations.Count > 0)
+			Fail($"Parameter values the caller never asked for:\n{violations.Distinct().JoinN()}");
+	}
+
+	/// <summary>
+	/// A search whose draws are all pinned to the same fraction of every range: one chromosome exists,
+	/// so one evaluated iteration says everything there is to say about what the search generates.
+	/// </summary>
+	private static GeneticOptimizer CreatePinnedDrawOptimizer(Strategy strategy, double fraction)
+	{
+		strategy.RandomProvider = new FixedFractionRandomProvider(fraction);
+
+		var storageRegistry = GetHistoryStorage();
+
+		var optimizer = new GeneticOptimizer(
+			new CollectionSecurityProvider([strategy.Security]),
+			new CollectionPortfolioProvider([strategy.Portfolio]),
+			storageRegistry,
+			Paths.FileSystem);
+
+		optimizer.EmulationSettings.BatchSize = 1;
+		optimizer.EmulationSettings.MaxIterations = 1;
+
+		return optimizer;
+	}
+
+	/// <summary>
+	/// Runs the search to the end and returns the parameter values it handed back, by parameter id.
+	/// </summary>
+	private async Task<Dictionary<string, object>> RunAndCollectParameters(
+		GeneticOptimizer optimizer,
+		Strategy strategy,
+		(IStrategyParam param, object from, object to, object step, IEnumerable values)[] geneticParams)
+	{
+		var values = new Dictionary<string, object>();
+
+		await foreach (var (_, parameters) in optimizer.RunAsync(
+			Paths.HistoryBeginDate,
+			Paths.HistoryBeginDate.AddDays(6),
+			strategy,
+			geneticParams,
+			s => s.PnL,
+			cancellationToken: CancellationToken))
+		{
+			foreach (var param in parameters)
+				values[param.Id] = param.Value;
+		}
+
+		IsTrue(values.Count > 0, "The search evaluated nothing, so there are no generated values to check.");
+
+		return values;
+	}
+
+	/// <summary>
+	/// With the draw pinned to the bottom of every range, the only value the caller can be handed is the
+	/// bottom of the range - whichever of the types the search generates values for it was asked about.
+	/// </summary>
+	[TestMethod]
+	[Timeout(120_000, CooperativeCancellation = true)]
+	public async Task GeneticParametersOfEveryTypeStayOnTheCallersGrid()
+	{
+		var strategy = new TypedParamsStrategy
+		{
+			Security = CreateTestSecurity(),
+			Portfolio = CreateTestPortfolio(),
+			Volume = 1,
+			CandleType = TimeSpan.FromMinutes(1).TimeFrame(),
+			Long = 80,
+			Short = 30,
+		};
+
+		// Every range runs from 10 to 14 in steps of 4, so the caller asked for two values, 10 and 14.
+		// Neither is a multiple of four: a grid measured from zero rather than from 'from' misses both.
+		var geneticParams = new (IStrategyParam param, object from, object to, object step, IEnumerable values)[]
+		{
+			(strategy.Parameters[nameof(SmaStrategy.Short)], 10, 14, 4, null),
+			(strategy.Parameters[nameof(TypedParamsStrategy.DecimalParam)], 10m, 14m, 4m, null),
+			(strategy.Parameters[nameof(TypedParamsStrategy.TimeSpanParam)], TimeSpan.FromMinutes(10), TimeSpan.FromMinutes(14), TimeSpan.FromMinutes(4), null),
+			(strategy.Parameters[nameof(SmaStrategy.StopValue)], new Unit(10, UnitTypes.Percent), new Unit(14, UnitTypes.Percent), new Unit(4, UnitTypes.Percent), null),
+		};
+
+		using var optimizer = CreatePinnedDrawOptimizer(strategy, 0d);
+
+		var values = await RunAndCollectParameters(optimizer, strategy, geneticParams);
+
+		AreEqual(10, (int)values[nameof(SmaStrategy.Short)], "the int parameter was drawn at the bottom of 10..14");
+		AreEqual(10m, (decimal)values[nameof(TypedParamsStrategy.DecimalParam)], "the decimal parameter was drawn at the bottom of 10..14");
+		AreEqual(TimeSpan.FromMinutes(10), (TimeSpan)values[nameof(TypedParamsStrategy.TimeSpanParam)], "the TimeSpan parameter was drawn at the bottom of 10..14 minutes");
+		AreEqual(new Unit(10, UnitTypes.Percent), (Unit)values[nameof(SmaStrategy.StopValue)], "the Unit parameter was drawn at the bottom of 10%..14%");
+	}
+
+	/// <summary>
+	/// A step written backwards names the same values as the same step written forwards, and a range
+	/// whose ends meet names exactly one value and leaves the search nothing to choose.
+	/// </summary>
+	[TestMethod]
+	[Timeout(120_000, CooperativeCancellation = true)]
+	public async Task GeneticParameterRangeReadsTheSameBackwardsAndAtASinglePoint()
+	{
+		var strategy = new SmaStrategy
+		{
+			Security = CreateTestSecurity(),
+			Portfolio = CreateTestPortfolio(),
+			Volume = 1,
+			CandleType = TimeSpan.FromMinutes(1).TimeFrame(),
+			Long = 80,
+			Short = 30,
+		};
+
+		// 14 down to 10 by -4 is the same request as 10 up to 14 by 4: the values are 10 and 14. The
+		// second range offers 65 alone, so 65 is the only answer there is.
+		var geneticParams = new (IStrategyParam param, object from, object to, object step, IEnumerable values)[]
+		{
+			(strategy.Parameters[nameof(SmaStrategy.Short)], 14, 10, -4, null),
+			(strategy.Parameters[nameof(SmaStrategy.Long)], 65, 65, 10, null),
+		};
+
+		using var optimizer = CreatePinnedDrawOptimizer(strategy, 0d);
+
+		var values = await RunAndCollectParameters(optimizer, strategy, geneticParams);
+
+		AreEqual(10, (int)values[nameof(SmaStrategy.Short)], "a backwards step still bottoms out at the low end of the range");
+		AreEqual(65, (int)values[nameof(SmaStrategy.Long)], "a range of one value can only produce that value");
+	}
+
+	/// <summary>
+	/// The bounds of a double parameter arrive as doubles - that is what StrategyParam&lt;double&gt;
+	/// holds and what every other reader of those bounds takes - so the search has to accept them.
+	/// </summary>
+	[TestMethod]
+	[Timeout(120_000, CooperativeCancellation = true)]
+	public async Task GeneticDoubleParameterTakesDoubleBounds()
+	{
+		var strategy = new TypedParamsStrategy
+		{
+			Security = CreateTestSecurity(),
+			Portfolio = CreateTestPortfolio(),
+			Volume = 1,
+			CandleType = TimeSpan.FromMinutes(1).TimeFrame(),
+			Long = 80,
+			Short = 30,
+		};
+
+		// The int parameter is here only to give the crossover a second gene to work with.
+		var geneticParams = new (IStrategyParam param, object from, object to, object step, IEnumerable values)[]
+		{
+			(strategy.Parameters[nameof(TypedParamsStrategy.DoubleParam)], 10d, 14d, 4d, null),
+			(strategy.Parameters[nameof(SmaStrategy.Short)], 10, 14, 2, null),
+		};
+
+		using var optimizer = CreatePinnedDrawOptimizer(strategy, 0d);
+
+		var values = await RunAndCollectParameters(optimizer, strategy, geneticParams);
+
+		AreEqual(10d, (double)values[nameof(TypedParamsStrategy.DoubleParam)], "the double parameter was drawn at the bottom of 10..14");
+	}
+
+	/// <summary>
+	/// Ten percent and fourteen absolute bound nothing, so the pair is a mistake to report rather than
+	/// a range to draw from: StrategyParamHelper.GetRandom, the other generator over the same bounds,
+	/// refuses it instead of quietly keeping one side's type and the other side's magnitude.
+	/// </summary>
+	[TestMethod]
+	[Timeout(120_000, CooperativeCancellation = true)]
+	public async Task GeneticUnitRangeWithMismatchedTypesIsRejected()
+	{
+		var strategy = new SmaStrategy
+		{
+			Security = CreateTestSecurity(),
+			Portfolio = CreateTestPortfolio(),
+			Volume = 1,
+			CandleType = TimeSpan.FromMinutes(1).TimeFrame(),
+			Long = 80,
+			Short = 30,
+		};
+
+		var geneticParams = new (IStrategyParam param, object from, object to, object step, IEnumerable values)[]
+		{
+			(strategy.Parameters[nameof(SmaStrategy.StopValue)], new Unit(10, UnitTypes.Percent), new Unit(14, UnitTypes.Absolute), new Unit(4, UnitTypes.Percent), null),
+			(strategy.Parameters[nameof(SmaStrategy.Short)], 10, 14, 2, null),
+		};
+
+		using var optimizer = CreatePinnedDrawOptimizer(strategy, 0d);
+
+		await ThrowsAsync<ArgumentException>(async () =>
+		{
+			await foreach (var _ in optimizer.RunAsync(
+				Paths.HistoryBeginDate,
+				Paths.HistoryBeginDate.AddDays(6),
+				strategy,
+				geneticParams,
+				s => s.PnL,
+				cancellationToken: CancellationToken))
+			{
+			}
+		});
 	}
 
 	/// <summary>

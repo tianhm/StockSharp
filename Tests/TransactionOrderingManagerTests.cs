@@ -834,4 +834,62 @@ public class TransactionOrderingManagerTests : BaseTestClass
 		snapshot.HasOrderInfo.AssertTrue();
 		snapshot.OrderId.AssertEqual(55555L);
 	}
+
+	/// <summary>
+	/// A trade that reaches the connection before the order it belongs to is held back until the
+	/// order names it, and the order's arrival is what lets it go. Whether some other subscription
+	/// on the same connection happens to be replaying a transaction log is nobody's business but
+	/// that subscription's: if it decides for the rest, a trade the account really made is held for
+	/// the life of the session and the order looks smaller than it was filled.
+	/// </summary>
+	[TestMethod]
+	public void ATradeHeldBackIsReleasedByItsOrderWhileATransactionLogIsBeingReplayed()
+	{
+		var logReceiver = new TestReceiver();
+		var manager = new TransactionOrderingManager(logReceiver, () => true);
+
+		var secId = CreateSecurityId();
+
+		// A transaction-log order-status subscription is open on this connection.
+		manager.ProcessInMessage(new OrderStatusMessage
+		{
+			TransactionId = 400,
+			IsSubscribe = true,
+		});
+
+		// A trade arrives naming an order nobody knows yet, so it is held back.
+		var (heldForward, _, heldSuspended) = manager.ProcessOutMessage(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			SecurityId = secId,
+			TransactionId = 0,
+			OriginalTransactionId = 0,
+			OrderId = 90001,
+			TradeId = 90002,
+			TradePrice = 25m,
+			TradeVolume = 1m,
+		});
+
+		heldForward.AssertNull("a trade whose order is unknown cannot be delivered yet");
+		heldSuspended.AssertFalse();
+
+		// The order itself arrives - on its own transaction, not under the log subscription.
+		var (orderForward, _, processSuspended) = manager.ProcessOutMessage(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Transactions,
+			SecurityId = secId,
+			TransactionId = 0,
+			OriginalTransactionId = 777,
+			HasOrderInfo = true,
+			OrderId = 90001,
+			OrderState = OrderStates.Active,
+			Balance = 1m,
+		});
+
+		orderForward.AssertNotNull("the order itself is news the caller is waiting for");
+		processSuspended.AssertTrue("the order has arrived, so the trade waiting on it has to be let go");
+
+		manager.GetSuspendedTrades((ExecutionMessage)orderForward).Length
+			.AssertEqual(1, "and the trade it releases is the one that was held");
+	}
 }

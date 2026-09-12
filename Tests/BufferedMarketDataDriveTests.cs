@@ -1,12 +1,13 @@
-namespace StockSharp.Tests;
+﻿namespace StockSharp.Tests;
 
 [TestClass]
 public class BufferedMarketDataDriveTests : BaseTestClass
 {
-	private sealed class RecordingStorage(SecurityId securityId, DataType dataType, Func<bool> isFailing) : IMarketDataStorage
+	private sealed class RecordingStorage(SecurityId securityId, DataType dataType, Func<bool> isFailing, Func<int> acceptBeforeFailure, Func<int> reportSaved) : IMarketDataStorage
 	{
 		private readonly Lock _sync = new();
 		private readonly List<Message> _saved = [];
+		private readonly List<Message[]> _batches = [];
 
 		public Message[] Saved
 		{
@@ -14,6 +15,16 @@ public class BufferedMarketDataDriveTests : BaseTestClass
 			{
 				using (_sync.EnterScope())
 					return [.. _saved];
+			}
+		}
+
+		// What every write was handed, in the order the writes were made.
+		public Message[][] Batches
+		{
+			get
+			{
+				using (_sync.EnterScope())
+					return [.. _batches];
 			}
 		}
 
@@ -30,13 +41,33 @@ public class BufferedMarketDataDriveTests : BaseTestClass
 			if (cancellationToken.IsCancellationRequested)
 				Interlocked.Increment(ref CancelledSaveAttempts);
 
+			// Copied: the caller hands over its own live batch and clears it once the write went through.
+			using (_sync.EnterScope())
+				_batches.Add([.. list]);
+
+			var accepted = acceptBeforeFailure();
+
+			// Part of the batch is on disk and the rest is not - what a storage that runs out of room
+			// half way through a write leaves behind.
+			if (accepted >= 0)
+			{
+				using (_sync.EnterScope())
+					_saved.AddRange(list.Take(accepted));
+
+				throw new InvalidOperationException("Storage ran out of room half way through.");
+			}
+
 			if (isFailing())
 				throw new InvalidOperationException("Storage is down.");
 
 			using (_sync.EnterScope())
 				_saved.AddRange(list);
 
-			return new(list.Count);
+			// A storage may take the whole batch and still answer with a smaller number: a real one
+			// skips the rows it already holds (AppendOnlyNew) and counts only what it wrote.
+			var saved = reportSaved();
+
+			return new(saved >= 0 ? saved : list.Count);
 		}
 
 		DataType IMarketDataStorage.DataType => dataType;
@@ -58,6 +89,9 @@ public class BufferedMarketDataDriveTests : BaseTestClass
 		private readonly SynchronizedSet<SecurityId> _failingSecurities = [];
 		private readonly Lock _sync = new();
 
+		private readonly Queue<int> _acceptBeforeFailure = new();
+		private readonly Queue<int> _reportedSaved = new();
+
 		private IMarketDataDrive _lastAskedFor;
 		private StorageFormats _lastAskedFormat;
 
@@ -66,6 +100,27 @@ public class BufferedMarketDataDriveTests : BaseTestClass
 		public void FailFor(SecurityId securityId) => _failingSecurities.Add(securityId);
 
 		public void StopFailingFor(SecurityId securityId) => _failingSecurities.Remove(securityId);
+
+		// The next write keeps this many messages of the batch it is handed and then fails; every write
+		// after it behaves as usual, so what a retry is handed can be told apart from what was kept.
+		// Said more than once, the counts are used up by consecutive writes in the order they were given.
+		public void FailNextWriteAfter(int accepted) => Push(_acceptBeforeFailure, accepted);
+
+		// The next write stores everything it is handed and answers with this count instead of the
+		// batch size, which is what a storage that filtered part of the batch out reports.
+		public void ReportNextWriteSaved(int saved) => Push(_reportedSaved, saved);
+
+		private void Push(Queue<int> queue, int value)
+		{
+			using (_sync.EnterScope())
+				queue.Enqueue(value);
+		}
+
+		private int Take(Queue<int> queue)
+		{
+			using (_sync.EnterScope())
+				return queue.Count > 0 ? queue.Dequeue() : -1;
+		}
 
 		public IMarketDataDrive Underlying { get; }
 
@@ -85,7 +140,10 @@ public class BufferedMarketDataDriveTests : BaseTestClass
 						_lastAskedFormat = format;
 					}
 
-					return _storages.SafeAdd((secId, dataType), key => new(key.secId, key.dataType, () => IsFailing || _failingSecurities.Contains(key.secId)));
+					return _storages.SafeAdd((secId, dataType), key => new(key.secId, key.dataType,
+						() => IsFailing || _failingSecurities.Contains(key.secId),
+						() => Take(_acceptBeforeFailure),
+						() => Take(_reportedSaved)));
 				});
 
 			Underlying = Mock.Of<IMarketDataDrive>();
@@ -120,6 +178,9 @@ public class BufferedMarketDataDriveTests : BaseTestClass
 
 		public Message[] SavedFor(SecurityId secId, DataType dataType)
 			=> _storages.TryGetValue((secId, dataType), out var storage) ? storage.Saved : [];
+
+		public Message[][] BatchesFor(SecurityId secId, DataType dataType)
+			=> _storages.TryGetValue((secId, dataType), out var storage) ? storage.Batches : [];
 	}
 
 	private static readonly SecurityId _secId = new() { SecurityCode = "TEST", BoardCode = BoardCodes.Test };
@@ -138,6 +199,36 @@ public class BufferedMarketDataDriveTests : BaseTestClass
 	};
 
 	private static ExecutionMessage CreateTick(int index) => CreateTick(_secId, index);
+
+	// The rows themselves, named by the id each tick carries, so a row that went down twice or not
+	// at all is visible in the failure and not just in a count.
+	private static string TradeIds(IEnumerable<Message> messages)
+		=> messages.Cast<ExecutionMessage>().Select(m => $"{m.TradeId}").JoinComma();
+
+	// One batch of five that the storage half writes before it fails, and one retry at shutdown.
+	private async Task<Harness> HalfWrittenBatchAsync()
+	{
+		var harness = new Harness(1000, 1000);
+		var drive = harness.Drive;
+
+		drive.MaxBatchSize = 5;
+		drive.FlushInterval = TimeSpan.FromHours(1);
+
+		// The storage keeps the first three of the batch and only then fails, so the retry meets a
+		// storage that already holds part of what it is about to be handed.
+		harness.FailNextWriteAfter(3);
+
+		for (var i = 0; i < 5; i++)
+			drive.Enqueue(CreateTick(i));
+
+		await drive.StartAsync(CancellationToken);
+
+		await Helper.WaitUntilAsync(() => drive.FailedFlushes > 0, TimeSpan.FromSeconds(10), "the write that only half went through was counted as refused");
+
+		await drive.StopAsync(CancellationToken);
+
+		return harness;
+	}
 
 	[TestMethod]
 	public async Task FlushInterval_Elapsed_WritesWhatWaited()
@@ -599,6 +690,165 @@ public class BufferedMarketDataDriveTests : BaseTestClass
 		AreEqual(1, harness.SavedFor(_secId, DataType.Ticks).Length);
 
 		await drive.StopAsync(CancellationToken);
+	}
+
+	[TestMethod]
+	public async Task FailedFlushes_StorageWroteHalfTheBatch_LosesNothing()
+	{
+		// A failure half way through a write must cost no data: whichever side of it a row was on,
+		// it is in the storage once the retry went through.
+		var harness = await HalfWrittenBatchAsync();
+
+		var saved = harness.SavedFor(_secId, DataType.Ticks).Cast<ExecutionMessage>();
+
+		AreEqual("1,2,3,4,5", TradeIds(saved.DistinctBy(m => m.TradeId).OrderBy(m => m.TradeId)), "every row of the half-written batch is in the storage");
+		AreEqual(0L, harness.Drive.DroppedMessages, "a write that failed half way keeps its data rather than losing it");
+		AreEqual(0L, harness.Drive.BufferedMessages, "nothing is left waiting once the retry went through");
+	}
+
+	/// <summary>
+	/// A write that fails half way hands back no receipt: a storage answers with a count of what it
+	/// wrote only when the write returns, and the exception carries none. The drive therefore
+	/// cannot resume in the middle of a batch - it replays the same rows, in the order they arrived,
+	/// so that a storage which skips what it already holds can recognise them and de-duplicate. That
+	/// faithful replay is the drive's whole contribution to writing a row down once.
+	/// </summary>
+	[TestMethod]
+	public async Task FailedFlushes_PartialWrite_RetryReplaysTheSameRowsInTheSameOrder()
+	{
+		var harness = await HalfWrittenBatchAsync();
+
+		var batches = harness.BatchesFor(_secId, DataType.Ticks);
+
+		AreEqual(2, batches.Length, "one write that failed half way, then one retry");
+		AreEqual(TradeIds(batches[0]), TradeIds(batches[1]), "the retry replays the rows of the write that failed, not some other set");
+
+		for (var i = 0; i < batches[0].Length; i++)
+			AreSame(batches[0][i], batches[1][i], $"row {i} of the retry is the very row the first write was handed, in the same place, so a storage that skips what it already holds can tell it apart");
+	}
+
+	/// <summary>
+	/// What ends up stored after a write that failed half way is decided by the storage, not by the
+	/// drive: the drive knows only that the write threw, so it hands the whole batch over again, and
+	/// a storage that does not skip what it already holds keeps both copies. Worth pinning because a
+	/// reader who expects the drive to de-duplicate would be writing an order book twice.
+	/// </summary>
+	[TestMethod]
+	public async Task FailedFlushes_PartialWrite_RetryIsDecidedByWhatTheStorageHolds()
+	{
+		var harness = await HalfWrittenBatchAsync();
+
+		var batches = harness.BatchesFor(_secId, DataType.Ticks);
+
+		AreEqual(2, batches.Length, "one write that failed half way, then one retry");
+		AreEqual("1,2,3,4,5", TradeIds(batches[0]), "the first write is handed the whole batch");
+		AreEqual("1,2,3,4,5", TradeIds(batches[1]), "a failure reports no count, so the retry hands the whole batch over rather than guessing where the storage stopped");
+		AreEqual("1,2,3,1,2,3,4,5", TradeIds(harness.SavedFor(_secId, DataType.Ticks)), "the three rows the storage took before it failed are handed to it again: skipping them is the storage's own job");
+	}
+
+	[TestMethod]
+	public async Task FailedFlushes_TwoWritesInARowFailHalfWay_StillGetsEveryRowDown()
+	{
+		var harness = new Harness(1000, 1000);
+		var drive = harness.Drive;
+
+		drive.MaxBatchSize = 5;
+		drive.FlushInterval = TimeSpan.FromMilliseconds(50);
+
+		// A storage that stays sick: the first write keeps three rows of the batch and fails, the
+		// second keeps one and fails, and only the third goes through. Five rows went in, so all five
+		// have to be in the storage no matter which side of either failure they were on.
+		harness.FailNextWriteAfter(3);
+		harness.FailNextWriteAfter(1);
+
+		for (var i = 0; i < 5; i++)
+			drive.Enqueue(CreateTick(i));
+
+		await drive.StartAsync(CancellationToken);
+
+		await Helper.WaitUntilAsync(() => harness.SavedFor(_secId, DataType.Ticks).Cast<ExecutionMessage>().Select(m => m.TradeId).Distinct().Count() == 5, TimeSpan.FromSeconds(10), "the rows go down once a write finally goes through");
+
+		await drive.StopAsync(CancellationToken);
+
+		var saved = harness.SavedFor(_secId, DataType.Ticks).Cast<ExecutionMessage>();
+
+		AreEqual("1,2,3,4,5", TradeIds(saved.DistinctBy(m => m.TradeId).OrderBy(m => m.TradeId)), "no row is lost to a storage that fails half way through two writes running");
+		AreEqual(2L, drive.FailedFlushes, "the two writes that threw are the two that are counted");
+		AreEqual(0L, drive.DroppedMessages, "a write that failed half way keeps its data rather than losing it");
+		AreEqual(0L, drive.BufferedMessages, "nothing is left waiting once a write went through");
+	}
+
+	[TestMethod]
+	public async Task FailedFlushes_StorageWroteHalfTheBatch_LaterDataIsNotHeldUp()
+	{
+		var harness = new Harness(1000, 1000);
+		var drive = harness.Drive;
+
+		drive.MaxBatchSize = 5;
+		drive.FlushInterval = TimeSpan.FromMilliseconds(50);
+
+		harness.FailNextWriteAfter(3);
+
+		for (var i = 0; i < 5; i++)
+			drive.Enqueue(CreateTick(i));
+
+		await drive.StartAsync(CancellationToken);
+
+		await Helper.WaitUntilAsync(() => drive.FailedFlushes > 0, TimeSpan.FromSeconds(10), "the write that only half went through was counted as refused");
+
+		// The source goes on producing while the batch of the failed write is still waiting: seven ticks
+		// were handed over in all, so seven rows have to be in the storage when the drive stops.
+		drive.Enqueue(CreateTick(5));
+		drive.Enqueue(CreateTick(6));
+
+		await drive.StopAsync(CancellationToken);
+
+		var saved = harness.SavedFor(_secId, DataType.Ticks).Cast<ExecutionMessage>();
+
+		AreEqual("1,2,3,4,5,6,7", TradeIds(saved.DistinctBy(m => m.TradeId).OrderBy(m => m.TradeId)), "what arrived after the failure goes down together with what was waiting");
+		AreEqual(0L, drive.DroppedMessages);
+		AreEqual(0L, drive.BufferedMessages);
+
+		// Ticks are handed to the storage in the order they arrived, whichever of them a write starts at.
+		foreach (var batch in harness.BatchesFor(_secId, DataType.Ticks))
+			AreEqual(TradeIds(batch.Cast<ExecutionMessage>().OrderBy(m => m.TradeId)), TradeIds(batch), "a batch is handed over in the order the rows arrived");
+	}
+
+	[TestMethod]
+	public async Task FailedFlushes_StorageReportedFewerSavedThanHanded_IsNotARefusedWrite()
+	{
+		var harness = new Harness(1000, 1000);
+		var drive = harness.Drive;
+
+		drive.MaxBatchSize = 1000;
+		drive.FlushInterval = TimeSpan.FromMilliseconds(50);
+
+		// SaveAsync answers with the count of rows it wrote, and a storage that skips what it already
+		// holds writes fewer than it was handed without anything having gone wrong. A write that
+		// returned rather than threw is done: three ticks in, one reported written, nothing to retry.
+		harness.ReportNextWriteSaved(1);
+
+		for (var i = 0; i < 3; i++)
+			drive.Enqueue(CreateTick(i));
+
+		await drive.StartAsync(CancellationToken);
+
+		await Helper.WaitUntilAsync(() => harness.SaveAttempts == 1, TimeSpan.FromSeconds(10), "the batch was handed to the storage");
+
+		// Several rounds of the loop come and go, so a batch that was kept would be handed over again.
+		await Task.Delay(300, CancellationToken);
+
+		AreEqual(0L, drive.FailedFlushes, "a write that did not fail is not counted as refused");
+		AreEqual(1, harness.SaveAttempts, "a write that did not fail is not made a second time");
+		AreEqual(0L, drive.BufferedMessages, "a write that did not fail leaves nothing waiting");
+
+		drive.Enqueue(CreateTick(3));
+
+		await Helper.WaitUntilAsync(() => harness.Written == 4, TimeSpan.FromSeconds(10), "the drive goes on writing what arrives afterwards");
+
+		await drive.StopAsync(CancellationToken);
+
+		AreEqual(0L, drive.DroppedMessages);
 	}
 
 	[TestMethod]

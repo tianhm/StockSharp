@@ -49,9 +49,28 @@ public class StateValidatorTests : BaseTestClass
 		StateValidator.IsValid(OrderStates.Active, OrderStates.Pending).AssertFalse();
 		StateValidator.IsValid(OrderStates.Active, OrderStates.Failed).AssertFalse();
 
-		// Pending can only go to Active or Failed
+		// Pending never goes back to None - the order has already been sent.
 		StateValidator.IsValid(OrderStates.Pending, OrderStates.None).AssertFalse();
-		StateValidator.IsValid(OrderStates.Pending, OrderStates.Done).AssertFalse();
+	}
+
+	[TestMethod]
+	public void OrderStates_PendingToDone_IsValid()
+	{
+		// The venue's answer to a pending order can finish it in one step - an IOC/FOK acknowledged and
+		// then filled or killed without ever resting, or a cancel that lands before it rests. FIX reads
+		// the same way: PendingNew is followed by Filled, Canceled or Expired with no New in between.
+		StateValidator.IsValid(OrderStates.Pending, OrderStates.Done).AssertTrue();
+
+		// An order that skipped Pending may already reach Done; one that passed through it is not worse.
+		StateValidator.IsValid(OrderStates.None, OrderStates.Done).AssertTrue();
+	}
+
+	[TestMethod]
+	public void OrderStates_Validate_PendingToDone_DoesNotThrow()
+	{
+		// The same step through the throwing overload: this is the one OrderSnapshotHolder calls when
+		// ThrowOnInvalidStateTransition is on, so an immediately filled order must not become an exception.
+		StateValidator.Validate(OrderStates.Pending, OrderStates.Done, "test", null, throwOnInvalid: true).AssertTrue();
 	}
 
 	[TestMethod]
@@ -337,7 +356,9 @@ public class StateValidatorTests : BaseTestClass
 
 		OrderStates? pending = OrderStates.Pending;
 		pending.VerifyOrderState(OrderStates.Active, 123, null).AssertTrue();
-		pending.VerifyOrderState(OrderStates.Done, 123, null).AssertFalse();
+
+		OrderStates? done = OrderStates.Done;
+		done.VerifyOrderState(OrderStates.Active, 123, null).AssertFalse();
 	}
 
 	[TestMethod]

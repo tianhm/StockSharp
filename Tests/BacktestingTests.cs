@@ -1,4 +1,4 @@
-namespace StockSharp.Tests;
+﻿namespace StockSharp.Tests;
 
 using StockSharp.Algo.Basket;
 using StockSharp.Algo.Candles.Compression;
@@ -29,7 +29,7 @@ public class BacktestingTests : BaseTestClass
 	{
 		// Same condition as SkipIfNoHistoryData: without the sample history there is nothing to replay,
 		// and every dependent test bails out on its own guard.
-		if (Paths.HistoryDataPath is null)
+		if (AsmInit.SampleHistoryUnavailableReason is not null)
 			return;
 
 		var run = RunSharedFullMonthAsync(context.CancellationToken);
@@ -57,6 +57,36 @@ public class BacktestingTests : BaseTestClass
 			run.Result.Dispose();
 
 		_fullMonthRun = null;
+	}
+
+	/// <summary>
+	/// Every backtest in this class replays one fixed month of real market data that ships as the
+	/// StockSharp.Samples.HistoryData package. A machine that never restored it can say nothing about
+	/// the backtester, so it has to be told that - and told it as a result that is neither red nor
+	/// green, because a silent return counts the run as coverage it never had. When the package is
+	/// there, the month it declares has to be the month it actually holds: a partially restored copy
+	/// shortens every replay below without a word, and a backtest over three days answering a question
+	/// asked about thirty-one is a wrong answer that looks like a passing test.
+	/// </summary>
+	[TestMethod]
+	public async Task MissingSampleHistoryIsReportedAsInconclusiveNotAsAPass()
+	{
+		if (SkipIfNoHistoryData()) return;
+
+		var storage = GetHistoryStorage()
+			.GetTimeFrameCandleMessageStorage(CreateTestSecurity().Id.ToSecurityId(), TimeSpan.FromMinutes(1));
+
+		var stored = new List<DateTime>();
+
+		await foreach (var date in storage.GetDatesAsync().WithCancellation(CancellationToken))
+			stored.Add(date.Date);
+
+		var declared = new List<DateTime>();
+
+		for (var date = Paths.HistoryBeginDate.Date; date <= Paths.HistoryEndDate.Date; date = date.AddDays(1))
+			declared.Add(date);
+
+		AreEquivalent(declared, stored, $"The sample history at '{Paths.HistoryDataPath}' does not hold one minute candle day per day of the window every backtest below replays ({Paths.HistoryBeginDate:yyyy-MM-dd}..{Paths.HistoryEndDate:yyyy-MM-dd}) for {Paths.HistoryDefaultSecurity}.");
 	}
 
 	private static Task<FullMonthRun> GetFullMonthRunAsync()
@@ -823,13 +853,14 @@ public class BacktestingTests : BaseTestClass
 		return fs.GetStorage(Paths.HistoryDataPath);
 	}
 
+	// Reports a machine that never restored the sample history package as inconclusive and names it.
+	// Returning quietly instead would let every backtest in this class be counted as a test that passed
+	// on a machine where not one of them replayed a single candle.
 	private static bool SkipIfNoHistoryData()
 	{
-		if (Paths.HistoryDataPath == null)
-		{
-			Console.WriteLine("Skipping test: HistoryDataPath is null (stocksharp.samples.historydata package not installed)");
-			return true;
-		}
+		if (AsmInit.SampleHistoryUnavailableReason is string reason)
+			Inconclusive(reason);
+
 		return false;
 	}
 
@@ -2694,6 +2725,242 @@ public class BacktestingTests : BaseTestClass
 		var execWithIds = execMsgs.Where(e => e.GetSubscriptionIds().Length > 0).ToList();
 		Console.WriteLine($"ExecutionMessages with subscription IDs: {execWithIds.Count}");
 		IsTrue(execWithIds.Count > 0, "Expected ExecutionMessage to have subscription IDs from OrderStatus subscription");
+	}
+
+	// An emulation adapter built the way a live one is: an inner adapter of its own, an incoming
+	// channel, and the three providers the emulator needs.
+	private static EmulationMessageAdapter CreateEmulationAdapter(IMessageChannel channel)
+	{
+		return new(
+			new PassThroughMessageAdapter(new IncrementalIdGenerator()),
+			channel,
+			isEmulationOnly: true,
+			new CollectionSecurityProvider([CreateTestSecurity()]),
+			new CollectionPortfolioProvider([CreateTestPortfolio()]),
+			new InMemoryExchangeInfoProvider())
+		{
+			OwnInnerAdapter = false,
+		};
+	}
+
+	/// <summary>
+	/// A copy of a configured emulation adapter emulates on the same terms as the original.
+	/// </summary>
+	[TestMethod]
+	public void EmulationAdapter_Clone_KeepsSettings()
+	{
+		var adapter = CreateEmulationAdapter(new PassThroughMessageChannel());
+
+		var settings = adapter.Settings;
+
+		settings.Latency = TimeSpan.FromMilliseconds(250);
+		settings.MatchOnTouch = true;
+		settings.CheckMoney = true;
+		settings.CheckShortable = true;
+		settings.MaxDepth = 7;
+		settings.SpreadSize = 3;
+		settings.Failing = 12.5;
+		settings.CandlePrice = EmulationCandlePrices.Close;
+
+		var clone = (EmulationMessageAdapter)adapter.Clone();
+
+		// These are the same values Save/Load carries across a restart, so they are what the
+		// adapter is: a copy that fills on touch when the original does not, or checks money when
+		// the original does not, backtests a different strategy.
+		AreEqual(TimeSpan.FromMilliseconds(250), clone.Settings.Latency);
+		IsTrue(clone.Settings.MatchOnTouch, "the copy fills on touch, as the original does");
+		IsTrue(clone.Settings.CheckMoney, "the copy checks money, as the original does");
+		IsTrue(clone.Settings.CheckShortable, "the copy checks shortable, as the original does");
+		AreEqual(7, clone.Settings.MaxDepth);
+		AreEqual(3, clone.Settings.SpreadSize);
+		AreEqual(12.5, clone.Settings.Failing);
+		AreEqual(EmulationCandlePrices.Close, clone.Settings.CandlePrice);
+	}
+
+	/// <summary>
+	/// The copy carries its own settings, not a second reference to the original's.
+	/// </summary>
+	[TestMethod]
+	public void EmulationAdapter_Clone_SettingsAreItsOwn()
+	{
+		var adapter = CreateEmulationAdapter(new PassThroughMessageChannel());
+		adapter.Settings.MaxDepth = 7;
+
+		var clone = (EmulationMessageAdapter)adapter.Clone();
+		clone.Settings.MaxDepth = 9;
+
+		// Retuning one run must not retune the other.
+		AreEqual(7, adapter.Settings.MaxDepth, "the original keeps the depth it was given");
+		AreNotSame(adapter.Settings, clone.Settings);
+		AreNotSame(adapter.Emulator, clone.Emulator);
+	}
+
+	/// <summary>
+	/// Work handed to one emulation adapter stays with it and does not reach the copy.
+	/// </summary>
+	[TestMethod]
+	public async Task EmulationAdapter_Clone_DoesNotShareTheWork()
+	{
+		var adapter = CreateEmulationAdapter(new PassThroughMessageChannel());
+		var clone = (EmulationMessageAdapter)adapter.Clone();
+
+		var time = new DateTime(2026, 09, 09, 10, 00, 00, DateTimeKind.Utc);
+
+		await ((IMessageAdapter)adapter).SendInMessageAsync(new Level1ChangeMessage
+		{
+			SecurityId = CreateTestSecurity().ToSecurityId(),
+			ServerTime = time,
+			LocalTime = time,
+		}.TryAdd(Level1Fields.LastTradePrice, 100m), CancellationToken);
+
+		// One message sent to one adapter is one message of work. Two emulators fed from the same
+		// message means two books, two sets of orders and two sets of fills where the caller asked
+		// for one, and the copy - which was sent nothing - has to have nothing to show.
+		AreEqual(1L, adapter.Emulator.ProcessedMessageCount, "the adapter the message was sent to processed it");
+		AreEqual(0L, clone.Emulator.ProcessedMessageCount, "the copy was sent nothing and processed nothing");
+	}
+
+	/// <summary>
+	/// Disposing the emulation adapter detaches it from its emulator chain. Work still moving through
+	/// the incoming channel afterwards must not be raised out of an adapter its owner has torn down.
+	/// </summary>
+	[TestMethod]
+	public async Task EmulationAdapter_Dispose_StopsRaisingOutMessages()
+	{
+		var adapter = CreateEmulationAdapter(new PassThroughMessageChannel());
+		var target = (IMessageAdapter)adapter;
+
+		var securityId = CreateTestSecurity().ToSecurityId();
+		var portfolioName = CreateTestPortfolio().Name;
+		var time = new DateTime(2026, 09, 09, 10, 00, 00, DateTimeKind.Utc);
+
+		var received = new List<Message>();
+		adapter.NewOutMessageAsync += (msg, ct) => { received.Add(msg); return default; };
+
+		OrderRegisterMessage NewOrder(long transId) => new()
+		{
+			TransactionId = transId,
+			SecurityId = securityId,
+			PortfolioName = portfolioName,
+			Side = Sides.Buy,
+			Price = 100m,
+			Volume = 1,
+			OrderType = OrderTypes.Limit,
+			LocalTime = time,
+		};
+
+		await target.SendInMessageAsync(new ConnectMessage(), CancellationToken);
+		await target.SendInMessageAsync(new Level1ChangeMessage
+		{
+			SecurityId = securityId,
+			ServerTime = time,
+			LocalTime = time,
+		}
+		.TryAdd(Level1Fields.LastTradePrice, 100m)
+		.TryAdd(Level1Fields.BestBidPrice, 99m)
+		.TryAdd(Level1Fields.BestAskPrice, 101m), CancellationToken);
+
+		received.Clear();
+
+		await target.SendInMessageAsync(NewOrder(1000), CancellationToken);
+
+		// Without an answer here the probe below proves nothing - the chain has to be live first.
+		IsTrue(received.Count > 0, "the live adapter has to raise what the emulator answered");
+
+		adapter.Dispose();
+		received.Clear();
+
+		await target.SendInMessageAsync(NewOrder(1001), CancellationToken);
+
+		AreEqual(0, received.Count, $"the disposed adapter kept raising: {received.Select(m => $"{m.Type}").JoinComma()}");
+	}
+
+	/// <summary>
+	/// A backtest is an experiment, and an experiment has to be repeatable: the same data through the
+	/// same settings with the same random seed has to come back as the same run, down to the numbers
+	/// on the orders and the trades it reports. A user compares a rerun against the run before it -
+	/// after a change to a strategy, or against a stored reference log - and numbers drawn from the
+	/// clock the run happened to start at make every rerun differ from the one it is compared to for a
+	/// reason that has nothing to do with what was being tested.
+	/// </summary>
+	[TestMethod]
+	public async Task SameSeedProducesTheSameOrderAndTradeIds()
+	{
+		const int randomSeed = 42;
+		const long orderTransId = 1000;
+
+		var securityId = CreateTestSecurity().ToSecurityId();
+		var portfolioName = CreateTestPortfolio().Name;
+		var time = new DateTime(2026, 09, 09, 10, 00, 00, DateTimeKind.Utc);
+
+		// One run: the same instrument, the same quote, the same order, the same seed.
+		async Task<(string orderIds, string tradeIds)> RunAsync()
+		{
+			var adapter = CreateEmulationAdapter(new PassThroughMessageChannel());
+			var target = (IMessageAdapter)adapter;
+
+			var emulator = (MarketEmulator)adapter.Emulator;
+			emulator.RandomProvider = new DefaultEmulationRandomizer(randomSeed);
+
+			var received = new List<Message>();
+			emulator.NewOutMessageAsync += (msg, ct) => { received.Add(msg); return default; };
+
+			// A run starts where a real one starts: the reset is what puts the identifier generators
+			// back to where the settings say the run begins.
+			await target.SendInMessageAsync(new ResetMessage(), CancellationToken);
+			await target.SendInMessageAsync(new ConnectMessage(), CancellationToken);
+
+			await target.SendInMessageAsync(new Level1ChangeMessage
+			{
+				SecurityId = securityId,
+				ServerTime = time,
+				LocalTime = time,
+			}
+			.TryAdd(Level1Fields.LastTradePrice, 100m)
+			.TryAdd(Level1Fields.BestBidPrice, 99m)
+			.TryAdd(Level1Fields.BestAskPrice, 101m), CancellationToken);
+
+			// A buy at the ask, so the run has both an accepted order and a fill to report.
+			await target.SendInMessageAsync(new OrderRegisterMessage
+			{
+				TransactionId = orderTransId,
+				SecurityId = securityId,
+				PortfolioName = portfolioName,
+				Side = Sides.Buy,
+				Price = 101m,
+				Volume = 1,
+				OrderType = OrderTypes.Limit,
+				LocalTime = time,
+			}, CancellationToken);
+
+			var mine = received
+				.OfType<ExecutionMessage>()
+				.Where(m => m.OriginalTransactionId == orderTransId)
+				.ToArray();
+
+			var orderIds = mine.Where(m => m.OrderId is not null).Select(m => m.OrderId.Value.ToString()).Distinct().JoinComma();
+			var tradeIds = mine.Where(m => m.TradeId is not null).Select(m => m.TradeId.Value.ToString()).JoinComma();
+
+			adapter.Dispose();
+
+			return (orderIds, tradeIds);
+		}
+
+		var first = await RunAsync();
+
+		// The second run is started at a later instant, the way a rerun always is.
+		var startedAt = DateTime.UtcNow.Ticks;
+		SpinWait.SpinUntil(() => DateTime.UtcNow.Ticks != startedAt);
+
+		var second = await RunAsync();
+
+		IsNotEmpty(first.orderIds, "the run has to number the order it accepted, or there is nothing to compare");
+		IsNotEmpty(first.tradeIds, "and the fill it reported");
+
+		AreEqual(first.orderIds, second.orderIds,
+			$"the same run twice has to number its orders the same way: [{first.orderIds}] then [{second.orderIds}]");
+		AreEqual(first.tradeIds, second.tradeIds,
+			$"and its trades: [{first.tradeIds}] then [{second.tradeIds}]");
 	}
 
 	/// <summary>

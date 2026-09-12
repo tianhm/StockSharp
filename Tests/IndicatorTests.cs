@@ -31,19 +31,81 @@ public class IndicatorTests : BaseTestClass
 	// threads at once. Every stretch of code that touches the shared accelerator takes this lock.
 	private static readonly Lock _gpuLock = new();
 
+	// Why the shared device could not be created, or null when it was. Filled in by the single probe
+	// below so that every GPU test reads the same answer instead of paying for its own attempt.
+	private static string _gpuUnavailableReason;
+	private static bool _gpuProbed;
+
 	/// <summary>
-	/// Creates the shared device on first use. Doing it in <see cref="ClassInitializeAttribute"/> instead
-	/// would fail all tests in the class - including the majority that never touch the GPU - on a box
-	/// where no accelerator can be created.
+	/// Creates the shared device on first use, and reports a machine that cannot host one as
+	/// inconclusive rather than as a failed indicator. Doing it in <see cref="ClassInitializeAttribute"/>
+	/// instead would fail all tests in the class - including the majority that never touch the GPU - on
+	/// a box where no accelerator can be created.
 	/// </summary>
 	private static (Context, Accelerator) GetGpu()
 	{
+		SkipIfNoGpu();
+
+		using (_gpuLock.EnterScope())
+			return (_gpuContext, _gpuAccelerator);
+	}
+
+	// Probes for a device once and reports its absence as inconclusive. ILGPU offers a CPU accelerator
+	// on any machine, so this normally passes straight through; what it catches is a box whose only
+	// driver is broken or whose device went away, neither of which says anything about whether the
+	// calculators below compute the right numbers.
+	private static void SkipIfNoGpu()
+	{
 		using (_gpuLock.EnterScope())
 		{
-			if (_gpuAccelerator is null)
-				(_gpuContext, _gpuAccelerator) = GpuAcceleratorFactory.CreateBestAccelerator();
+			if (!_gpuProbed)
+			{
+				_gpuProbed = true;
 
-			return (_gpuContext, _gpuAccelerator);
+				try
+				{
+					if (GpuAcceleratorFactory.TryCreateBestAccelerator(out var context, out var accelerator))
+						(_gpuContext, _gpuAccelerator) = (context, accelerator);
+					else
+						_gpuUnavailableReason = "ILGPU reports no accelerator on this machine, so nothing in this class can run a GPU calculator.";
+				}
+				catch (Exception ex)
+				{
+					_gpuUnavailableReason = $"ILGPU could not create an accelerator on this machine ({ex.Message}), so nothing in this class can run a GPU calculator.";
+				}
+			}
+		}
+
+		if (_gpuUnavailableReason is string reason)
+			Inconclusive(reason);
+	}
+
+	/// <summary>
+	/// Every GPU test below compares a calculator against the CPU indicator it mirrors, and that
+	/// comparison only means something when there is a device to run the calculator on. A machine that
+	/// cannot create one is an environment, not a wrong indicator, and a suite that shows a missing
+	/// device as red teaches its readers to ignore red. The distinction is drawn once here: an absent
+	/// accelerator is reported inconclusive and named, while an accelerator that is present has to be
+	/// able to host a calculator, so that every failure below belongs to the code it is testing.
+	/// </summary>
+	[TestMethod]
+	public void MissingGpuAcceleratorIsReportedAsInconclusiveNotFailure()
+	{
+		var (gpuContext, gpuAccelerator) = GetGpu();
+
+		IsNotNull(gpuContext, "No ILGPU context was created, so nothing in this class can launch a kernel.");
+		IsNotNull(gpuAccelerator, "No ILGPU accelerator was created, so nothing in this class can launch a kernel.");
+
+		var provider = new GpuIndicatorCalculatorProvider();
+		provider.Init();
+
+		provider.TryGetCalculatorType(typeof(SimpleMovingAverage), out var calcType).AssertTrue("No GPU calculator is registered for the simplest indicator there is, so every comparison below fails for a reason that has nothing to do with the calculator it compares.");
+
+		using (_gpuLock.EnterScope())
+		{
+			var calc = provider.Create(gpuContext, gpuAccelerator, calcType);
+
+			IsNotNull(calc, "The device is there but refuses to host a calculator, so every failure below would name an indicator for a fault of the device.");
 		}
 	}
 
@@ -55,6 +117,8 @@ public class IndicatorTests : BaseTestClass
 
 		_gpuAccelerator = null;
 		_gpuContext = null;
+		_gpuUnavailableReason = null;
+		_gpuProbed = false;
 	}
 
 	private static IIndicatorValue CreateValue(IndicatorType type, IIndicator indicator, SecurityId secId, DateTime now, int idx, TimeSpan tf, bool isFinal, bool isEmpty, int diffLimit = 10, Random rnd = null)
@@ -204,9 +268,9 @@ public class IndicatorTests : BaseTestClass
 						compare(ae, (IEnumerable<object>)ev, indName);
 					else if (av is bool b1)
 					{
-						// GPU float32 precision can flip boolean trend direction near thresholds
-						if (!gpuTolerance)
-							b1.AssertEqual((bool)ev, indName);
+						// A flag is not an approximation: an inverted trend direction is wrong whatever the
+						// arithmetic, so it is compared exactly in every tolerance mode.
+						b1.AssertEqual((bool)ev, indName);
 					}
 					else if (av is int i1)
 						i1.AssertEqual((int)ev, indName);
@@ -218,9 +282,11 @@ public class IndicatorTests : BaseTestClass
 
 						if (gpuTolerance)
 						{
-							// GPU uses float32 (~7 sig digits), use relative tolerance
+							// GPU uses float32 (~7 sig digits), so the allowance is proportional to the
+							// magnitude compared. The floor stays at the ordinary comparison scale: it only
+							// covers values around zero, and never lets a small value be off by whole units.
 							var maxAbs = dA.Abs().Max(dE.Abs());
-							var tol = 1.01m.Max(maxAbs * 0.025m);
+							var tol = 0.01m.Max(maxAbs * 0.025m);
 							(diff <= tol).AssertTrue($"{indName} GPU={dA} CPU={dE} diff={diff} tol={tol}");
 						}
 						else
@@ -981,6 +1047,80 @@ public class IndicatorTests : BaseTestClass
 		}
 	}
 
+	/// <summary>
+	/// Both readers of a whole series - <c>IndicatorDataRunner.Check</c> and <c>CompareValue</c> - compare
+	/// nothing at all on a bar the indicator reports itself unformed on, so a sweep proves only as much as
+	/// the indicator forms early. That bound is what <see cref="IIndicator.NumValuesToInitialize"/> promises
+	/// a user: feed it that many final values and it is ready, and everything after them is a real value
+	/// that a reference run actually answers for. An indicator that quietly needs more leaves the front of
+	/// the series unchecked, and one that never forms is swept through with nothing checked at all.
+	/// </summary>
+	[TestMethod]
+	public async Task EveryIndicatorFormsWithinNumValuesToInitialize()
+	{
+		var time = new DateTime(2000, 1, 1, 0, 0, 0).UtcKind();
+		var tf = TimeSpan.FromDays(1);
+		var secId = Helper.CreateSecurityId();
+		var candles = await LoadCandles(secId, time, tf);
+
+		// These two decide they are formed from the values they see rather than from how many - the same
+		// pair NumValuesToInitialize excludes. The count they publish cannot be held to, but they still owe
+		// the weaker half of the promise: they have to become formed on a real series.
+		var dataDependent = new HashSet<Type>
+		{
+			typeof(AdaptiveLaguerreFilter),
+			typeof(DemandIndex),
+		};
+
+		var errors = new List<string>();
+
+		foreach (var type in GetIndicatorTypes())
+		{
+			var indicator = type.CreateIndicator();
+			var declared = indicator.NumValuesToInitialize;
+			var inputType = type.InputValue;
+			var formedAt = 0;
+
+			for (var i = 0; i < candles.Length; i++)
+			{
+				var candle = candles[i];
+
+				IIndicatorValue input;
+
+				if (inputType == typeof(DecimalIndicatorValue))
+					input = new DecimalIndicatorValue(indicator, candle.ClosePrice, candle.OpenTime) { IsFinal = true };
+				else if (inputType == typeof(CandleIndicatorValue))
+					input = new CandleIndicatorValue(indicator, candle) { IsFinal = true };
+				else
+					throw new InvalidOperationException(inputType.To<string>());
+
+				indicator.Process(input);
+
+				if (indicator.IsFormed)
+				{
+					formedAt = i + 1;
+					break;
+				}
+			}
+
+			var name = type.Indicator.Name;
+
+			if (formedAt == 0)
+				errors.Add($"{name}: never formed over {candles.Length} candles, so no value of it was ever compared.");
+			else if (formedAt > declared && !dataDependent.Contains(type.Indicator))
+				errors.Add($"{name}: asks for {declared} value(s) but was formed only after {formedAt}, leaving {formedAt - declared} bar(s) beyond the declared warm-up unchecked.");
+		}
+
+		if (errors.Count > 0)
+		{
+			var report = errors
+				.OrderBy(error => error, StringComparer.Ordinal)
+				.JoinN();
+
+			Fail($"Indicators not formed within NumValuesToInitialize ({errors.Count}):{Environment.NewLine}{report}");
+		}
+	}
+
 	// ---------------------------------------------------------------------------------------------------------
 	// Reference-vector generator for Resources/IndicatorsData/<Indicator>.txt.
 	//
@@ -1612,6 +1752,353 @@ public class IndicatorTests : BaseTestClass
 		provider.All.Count.AssertEqual(0);
 	}
 
+	// Register documents itself as "register (or replace)", so registering over a mapping Init already
+	// discovered must leave the newer calculator in place instead of refusing the call.
+	[TestMethod]
+	public void GpuProviderRegisterReplacesExistingMapping()
+	{
+		var provider = new GpuIndicatorCalculatorProvider();
+		provider.Init();
+
+		provider.TryGetCalculatorType(typeof(SimpleMovingAverage), out var discovered).AssertTrue();
+		discovered.AssertEqual(typeof(GpuSmaCalculator));
+
+		provider.Register<SimpleMovingAverage, GpuHighestCalculator>();
+
+		provider.TryGetCalculatorType(typeof(SimpleMovingAverage), out var replaced).AssertTrue();
+		replaced.AssertEqual(typeof(GpuHighestCalculator));
+		provider.All.Keys.Count(k => k == typeof(SimpleMovingAverage)).AssertEqual(1);
+	}
+
+	// One batch mixes empty, single-bar and long series: every cell must line up with its own series and
+	// bar, so result[s][p][i] carries that series' value and nobody else's. Closes on the long series are
+	// 10..100, so SMA(3) at bar i is (10(i-1) + 10i + 10(i+1)) / 3 = 10i.
+	[TestMethod]
+	public void GpuSmaHeterogeneousBatchKeepsSeriesAligned()
+	{
+		var start = new DateTime(2020, 1, 1).UtcKind();
+
+		static GpuCandle bar(DateTime time, decimal close)
+			=> new(time, close, close, close, close, 1m);
+
+		var single = new[] { bar(start, 777m) };
+		var longSeries = new GpuCandle[10];
+
+		for (var i = 0; i < longSeries.Length; i++)
+			longSeries[i] = bar(start.AddMinutes(i), 10m * (i + 1));
+
+		GpuCandle[][] series = [[], single, longSeries, null];
+
+		// L = 1 (the price itself), then window-1, window and window+1 against the ten-bar series.
+		var parameters = new[]
+		{
+			new GpuSmaParams(1, (byte)Level1Fields.ClosePrice),
+			new GpuSmaParams(3, (byte)Level1Fields.ClosePrice),
+			new GpuSmaParams(9, (byte)Level1Fields.ClosePrice),
+			new GpuSmaParams(10, (byte)Level1Fields.ClosePrice),
+			new GpuSmaParams(11, (byte)Level1Fields.ClosePrice),
+		};
+
+		GpuIndicatorResult[][][] res;
+		var (gpuContext, gpuAccelerator) = GetGpu();
+
+		using (_gpuLock.EnterScope())
+		{
+			var calc = new GpuSmaCalculator(gpuContext, gpuAccelerator);
+			res = calc.Calculate(series, parameters);
+		}
+
+		static void formed(GpuIndicatorResult actual, GpuCandle candle, decimal expected, string name)
+		{
+			actual.Time.AssertEqual(candle.Time, name);
+			actual.IsFormed.AssertEqual((byte)1, name);
+			float.IsNaN(actual.Value).AssertFalse(name);
+			((decimal)actual.Value).AssertEqual(expected, name);
+		}
+
+		static void notFormed(GpuIndicatorResult actual, GpuCandle candle, string name)
+		{
+			actual.Time.AssertEqual(candle.Time, name);
+			actual.IsFormed.AssertEqual((byte)0, name);
+			float.IsNaN(actual.Value).AssertTrue(name);
+		}
+
+		res.Length.AssertEqual(series.Length);
+
+		for (var p = 0; p < parameters.Length; p++)
+		{
+			res[0][p].Length.AssertEqual(0, "empty series");
+			res[3][p].Length.AssertEqual(0, "null series");
+			res[1][p].Length.AssertEqual(single.Length, "single series");
+			res[2][p].Length.AssertEqual(longSeries.Length, "long series");
+		}
+
+		// L = 1: every bar is formed and equal to its own close.
+		for (var i = 0; i < longSeries.Length; i++)
+			formed(res[2][0][i], longSeries[i], 10m * (i + 1), $"L1 #{i}");
+
+		formed(res[1][0][0], single[0], 777m, "single L1");
+
+		// L = 3: the first two bars have no full window, then the closed form above.
+		notFormed(res[2][1][0], longSeries[0], "L3 #0");
+		notFormed(res[2][1][1], longSeries[1], "L3 #1");
+
+		for (var i = 2; i < longSeries.Length; i++)
+			formed(res[2][1][i], longSeries[i], 10m * i, $"L3 #{i}");
+
+		// L = 9: mean of 10..90 = 50 at bar 8, mean of 20..100 = 60 at bar 9.
+		for (var i = 0; i < 8; i++)
+			notFormed(res[2][2][i], longSeries[i], $"L9 #{i}");
+
+		formed(res[2][2][8], longSeries[8], 50m, "L9 #8");
+		formed(res[2][2][9], longSeries[9], 60m, "L9 #9");
+
+		// L = 10: only the last bar fills - mean of 10..100 = 55.
+		for (var i = 0; i < 9; i++)
+			notFormed(res[2][3][i], longSeries[i], $"L10 #{i}");
+
+		formed(res[2][3][9], longSeries[9], 55m, "L10 #9");
+
+		// L = 11 never fills on ten bars, and no window wider than one bar fills the single-bar series.
+		for (var i = 0; i < longSeries.Length; i++)
+			notFormed(res[2][4][i], longSeries[i], $"L11 #{i}");
+
+		for (var p = 1; p < parameters.Length; p++)
+			notFormed(res[1][p][0], single[0], $"single P{p}");
+	}
+
+	// A batch whose series are all empty is still a well-formed request - the array of series is not
+	// empty, only its members are. The caller gets its [series][param] shape back with no bars in it.
+	[TestMethod]
+	public void GpuSmaAllEmptySeriesReturnsShapedResult()
+	{
+		GpuCandle[][] series = [[], null, []];
+
+		var parameters = new[]
+		{
+			new GpuSmaParams(3, (byte)Level1Fields.ClosePrice),
+			new GpuSmaParams(5, (byte)Level1Fields.ClosePrice),
+		};
+
+		GpuIndicatorResult[][][] res;
+		var (gpuContext, gpuAccelerator) = GetGpu();
+
+		using (_gpuLock.EnterScope())
+		{
+			var calc = new GpuSmaCalculator(gpuContext, gpuAccelerator);
+			res = calc.Calculate(series, parameters);
+		}
+
+		res.Length.AssertEqual(series.Length);
+
+		foreach (var perParam in res)
+		{
+			perParam.Length.AssertEqual(parameters.Length);
+
+			foreach (var bars in perParam)
+				bars.Length.AssertEqual(0);
+		}
+	}
+
+	// Params are plain public structs, so Calculate is reachable with values the CPU setter would reject.
+	// A window of zero or fewer bars has nothing to average or scan, so no bar may come back formed -
+	// GpuHighestCalculator already guards exactly this way, and the family has to answer alike.
+	[TestMethod]
+	public void GpuCalculatorsFormNothingWhenLengthIsNotPositive()
+	{
+		var start = new DateTime(2020, 1, 1).UtcKind();
+		var bars = new GpuCandle[5];
+
+		for (var i = 0; i < bars.Length; i++)
+		{
+			var price = 10m * (i + 1);
+			bars[i] = new(start.AddMinutes(i), price, price, price, price, 1m);
+		}
+
+		GpuCandle[][] series = [bars];
+
+		var smaParams = new[]
+		{
+			new GpuSmaParams(0, (byte)Level1Fields.ClosePrice),
+			new GpuSmaParams(-3, (byte)Level1Fields.ClosePrice),
+		};
+
+		var highestParams = new[]
+		{
+			new GpuHighestParams(0),
+			new GpuHighestParams(-3),
+		};
+
+		GpuIndicatorResult[][][] sma;
+		GpuIndicatorResult[][][] highest;
+		var (gpuContext, gpuAccelerator) = GetGpu();
+
+		using (_gpuLock.EnterScope())
+		{
+			sma = new GpuSmaCalculator(gpuContext, gpuAccelerator).Calculate(series, smaParams);
+			highest = new GpuHighestCalculator(gpuContext, gpuAccelerator).Calculate(series, highestParams);
+		}
+
+		static void nothingFormed(GpuIndicatorResult[][][] res, string name)
+		{
+			for (var p = 0; p < res[0].Length; p++)
+			{
+				for (var i = 0; i < res[0][p].Length; i++)
+					res[0][p][i].IsFormed.AssertEqual((byte)0, $"{name} P{p} #{i}");
+			}
+		}
+
+		nothingFormed(sma, nameof(GpuSmaCalculator));
+		nothingFormed(highest, nameof(GpuHighestCalculator));
+	}
+
+	// CPU/GPU agreement inside the suite's 2.5% band says the two ran the same way, not that either is
+	// right, so these values come from arithmetic done here. Closes are exact quarters; high = close + 1.5
+	// and low = close - 0.75 put the typical price (H + L + C) / 3 at exactly close + 0.25, so the SMA over
+	// each price type differs from the close SMA by a known constant. float32 keeps ~7 significant digits
+	// and summing three of them costs at most ~1e-6 relative, so 1e-5 is honest headroom for the kernel -
+	// and 2500 times tighter than the band the matrix test is allowed.
+	[TestMethod]
+	public void GpuSmaMatchesHandComputedValues()
+	{
+		var start = new DateTime(2020, 1, 1).UtcKind();
+		decimal[] closes = [101.25m, 102.5m, 99.75m, 100.5m, 103.25m, 98.5m];
+		var bars = new GpuCandle[closes.Length];
+
+		for (var i = 0; i < closes.Length; i++)
+			bars[i] = new(start.AddMinutes(i), closes[i], closes[i] + 1.5m, closes[i] - 0.75m, closes[i], 1m);
+
+		GpuCandle[][] series = [bars];
+
+		var parameters = new[]
+		{
+			new GpuSmaParams(3, (byte)Level1Fields.ClosePrice),
+			new GpuSmaParams(3, (byte)Level1Fields.AveragePrice),
+			new GpuSmaParams(3, (byte)Level1Fields.HighPrice),
+		};
+
+		GpuIndicatorResult[][][] res;
+		var (gpuContext, gpuAccelerator) = GetGpu();
+
+		using (_gpuLock.EnterScope())
+		{
+			var calc = new GpuSmaCalculator(gpuContext, gpuAccelerator);
+			res = calc.Calculate(series, parameters);
+		}
+
+		// Three-bar close sums: 303.5, 302.75, 303.5, 302.25 for bars 2..5.
+		decimal[] closeSma = [303.5m / 3m, 302.75m / 3m, 303.5m / 3m, 302.25m / 3m];
+
+		static void check(GpuIndicatorResult actual, decimal expected, string name)
+		{
+			actual.IsFormed.AssertEqual((byte)1, name);
+			float.IsNaN(actual.Value).AssertFalse(name);
+
+			var value = (decimal)actual.Value;
+			var tol = expected.Abs() * 0.00001m;
+
+			((value - expected).Abs() <= tol).AssertTrue($"{name}: gpu={value} expected={expected} tol={tol}");
+		}
+
+		for (var i = 0; i < closeSma.Length; i++)
+		{
+			var bar = i + 2;
+
+			check(res[0][0][bar], closeSma[i], $"close #{bar}");
+			check(res[0][1][bar], closeSma[i] + 0.25m, $"average #{bar}");
+			check(res[0][2][bar], closeSma[i] + 1.5m, $"high #{bar}");
+		}
+
+		// The first two bars carry no full window whichever price type is asked for.
+		for (var p = 0; p < parameters.Length; p++)
+		{
+			res[0][p][0].IsFormed.AssertEqual((byte)0, $"P{p} #0");
+			res[0][p][1].IsFormed.AssertEqual((byte)0, $"P{p} #1");
+		}
+	}
+
+	/// <summary>
+	/// The CPU/GPU matrix accepts any value within 2.5% of its CPU twin, which on an EMA of 1000 is a band
+	/// 25 wide: the two agreeing inside it says they were written from the same idea, not that the idea is
+	/// right, and a kernel with a wrong smoothing factor sits comfortably inside it. These values are
+	/// computed here from the definition instead - an EMA seeded with the mean of the first Length closes
+	/// and then carried by EMA = previous + k * (price - previous), k = 2 / (Length + 1) - so a user asking
+	/// the GPU for an EMA gets an EMA. Closes are whole numbers and Length 3 puts k at exactly 0.5, so every
+	/// expected value is exact in float32 and the allowance is 2500 times tighter than the matrix band.
+	/// </summary>
+	[TestMethod]
+	public void GpuEmaMatchesHandComputedValues()
+	{
+		var start = new DateTime(2020, 1, 1).UtcKind();
+		decimal[] closes = [100m, 104m, 108m, 112m, 116m, 120m];
+		var bars = new GpuCandle[closes.Length];
+
+		// High is two above the close throughout, so the EMA over highs is the EMA over closes plus two.
+		for (var i = 0; i < closes.Length; i++)
+			bars[i] = new(start.AddMinutes(i), closes[i], closes[i] + 2m, closes[i] - 2m, closes[i], 1m);
+
+		GpuCandle[][] series = [bars];
+
+		var parameters = new[]
+		{
+			new GpuEmaParams(3, (byte)Level1Fields.ClosePrice),
+			new GpuEmaParams(3, (byte)Level1Fields.HighPrice),
+			new GpuEmaParams(1, (byte)Level1Fields.ClosePrice),
+			new GpuEmaParams(7, (byte)Level1Fields.ClosePrice),
+		};
+
+		GpuIndicatorResult[][][] res;
+		var (gpuContext, gpuAccelerator) = GetGpu();
+
+		using (_gpuLock.EnterScope())
+		{
+			var calc = new GpuEmaCalculator(gpuContext, gpuAccelerator);
+			res = calc.Calculate(series, parameters);
+		}
+
+		static void formed(GpuIndicatorResult actual, decimal expected, string name)
+		{
+			actual.IsFormed.AssertEqual((byte)1, name);
+			float.IsNaN(actual.Value).AssertFalse(name);
+
+			var value = (decimal)actual.Value;
+			var tol = expected.Abs() * 0.00001m;
+
+			((value - expected).Abs() <= tol).AssertTrue($"{name}: gpu={value} expected={expected} tol={tol}");
+		}
+
+		static void notFormed(GpuIndicatorResult actual, string name)
+		{
+			actual.IsFormed.AssertEqual((byte)0, name);
+			float.IsNaN(actual.Value).AssertTrue(name);
+		}
+
+		// Seed = (100 + 104 + 108) / 3 = 104, then 104 + 0.5 * (112 - 104) = 108,
+		// 108 + 0.5 * (116 - 108) = 112 and 112 + 0.5 * (120 - 112) = 116.
+		decimal[] closeEma = [104m, 108m, 112m, 116m];
+
+		notFormed(res[0][0][0], "close #0");
+		notFormed(res[0][0][1], "close #1");
+		notFormed(res[0][1][0], "high #0");
+		notFormed(res[0][1][1], "high #1");
+
+		for (var i = 0; i < closeEma.Length; i++)
+		{
+			var bar = i + 2;
+
+			formed(res[0][0][bar], closeEma[i], $"close #{bar}");
+			formed(res[0][1][bar], closeEma[i] + 2m, $"high #{bar}");
+		}
+
+		// Length 1 has no smoothing left to do: every bar is formed and equal to its own close.
+		for (var i = 0; i < closes.Length; i++)
+			formed(res[0][2][i], closes[i], $"L1 #{i}");
+
+		// Length 7 never completes its seed window on six bars, so no bar may claim a value.
+		for (var i = 0; i < closes.Length; i++)
+			notFormed(res[0][3][i], $"L7 #{i}");
+	}
+
 	[TestMethod]
 	[Timeout(120_000, CooperativeCancellation = true)]
 	public async Task IndicatorValues_Roundtrip()
@@ -2129,6 +2616,55 @@ public class IndicatorTests : BaseTestClass
 	}
 
 	[TestMethod]
+	public void ARefusedValueDoesNotUndoWhatCameBeforeIt()
+	{
+		// The parameters are applied one by one, so a bad one arrives after good ones have already
+		// landed. Length 0 is refused by the indicator (a period is at least 1), and refusing it must
+		// cost nothing else: %K keeps the 21 it was given, %D keeps the 3 its constructor chose.
+		var stoch = new StochasticOscillator();
+		stoch.ApplyParameters([new("K.Length", (object)21), new("D.Length", (object)0)]);
+
+		stoch.K.Length.AssertEqual(21);
+		stoch.D.Length.AssertEqual(3);
+	}
+
+	[TestMethod]
+	public void ARefusedValueLeavesTheOneAlreadyAcceptedForThatProperty()
+	{
+		// Same property twice: the second value is out of range, so it is not applied - which leaves
+		// the accepted 7 standing. Rolling back to the indicator's own default of 32 would silently
+		// hand back a different moving average than the caller was told took effect.
+		var sma = new SimpleMovingAverage();
+		sma.ApplyParameters([new("Length", (object)7), new("Length", (object)(-1))]);
+
+		sma.Length.AssertEqual(7);
+	}
+
+	[TestMethod]
+	public void APathThroughAPartThatDoesNotExistIsSkippedWholesale()
+	{
+		// Nothing named NoSuchPart sits inside the stochastic oscillator, so there is no property to
+		// set at the end of that path. The request is dropped, not applied to the root indicator and
+		// not allowed to abandon the rest of the batch.
+		var stoch = new StochasticOscillator();
+		stoch.ApplyParameters([new("NoSuchPart.Length", (object)99), new("K.Length", (object)21)]);
+
+		stoch.K.Length.AssertEqual(21);
+		stoch.D.Length.AssertEqual(3);
+	}
+
+	[TestMethod]
+	public void AValueThatIsNotANumberAtAllLeavesTheDefault()
+	{
+		// Text that no conversion can turn into a period must not reach Length. The indicator stays
+		// on the 32 its constructor chose rather than on some coerced value.
+		var sma = new SimpleMovingAverage();
+		sma.ApplyParameters(new Dictionary<string, object> { ["Length"] = "not a number" });
+
+		sma.Length.AssertEqual(32);
+	}
+
+	[TestMethod]
 	public void EverySeriesOfACompositeCarriesAValue()
 	{
 		var start = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc);
@@ -2309,6 +2845,78 @@ public class IndicatorTests : BaseTestClass
 		preview.GetValue<decimal>().AssertEqual(previous.GetValue<decimal>());
 		final.GetValue<decimal>().AssertEqual(previous.GetValue<decimal>());
 	}
+
+	// A flag carries no rounding error: an inverted trend direction must fail the GPU/CPU comparison in
+	// every tolerance mode, not only the exact one.
+	[TestMethod]
+	public void CompareValueChecksBoolResultsUnderGpuTolerance()
+	{
+		var ind = new SuperTrend();
+		var t = DateTime.UtcNow;
+		const string name = nameof(SuperTrend);
+
+		static SuperTrendIndicatorValue trend(IIndicator indicator, decimal price, bool isUpTrend, DateTime time)
+			=> new(indicator, price, isUpTrend, time) { IsFinal = true, IsFormed = true };
+
+		CompareValue(trend(ind, 100m, true, t), trend(ind, 100m, true, t), name, true, gpuTolerance: true);
+
+		Throws<AssertFailedException>(() => CompareValue(trend(ind, 100m, false, t), trend(ind, 100m, true, t), name, true, gpuTolerance: true));
+		Throws<AssertFailedException>(() => CompareValue(trend(ind, 100m, false, t), trend(ind, 100m, true, t), name, true));
+	}
+
+	// The GPU allowance is proportional to the magnitude compared, so float32 drift on a large value passes
+	// while a small value being wrong by whole units does not.
+	[TestMethod]
+	public void CompareValueGpuToleranceScalesWithMagnitude()
+	{
+		var ind = new PassThroughIndicator();
+		var t = DateTime.UtcNow;
+		const string name = nameof(PassThroughIndicator);
+
+		static DecimalIndicatorValue dec(IIndicator indicator, decimal v, DateTime time)
+			=> new(indicator, v, time) { IsFinal = true, IsFormed = true };
+
+		CompareValue(dec(ind, 1000.02m, t), dec(ind, 1000m, t), name, true, gpuTolerance: true);
+
+		Throws<AssertFailedException>(() => CompareValue(dec(ind, 0.5m, t), dec(ind, 1.4m, t), name, true, gpuTolerance: true));
+	}
+
+	// A reference value that a fresh run no longer produces is a regression, whether the row went empty
+	// altogether or only in a column past the ones still produced.
+	[TestMethod]
+	public void ValidatedDiffsReportsLostValues()
+	{
+		static string[] diffs(string[] rows, string[] committed)
+			=> new IndicatorDataRunner.RenderedSeries { Rows = rows, FormedFrom = 0, Epsilon = 0.1m }.ValidatedDiffs(committed);
+
+		diffs(["1,2"], ["1,2"]).Length.AssertEqual(0);
+		diffs(["1,2"], ["1.05,2"]).Length.AssertEqual(0);
+		diffs(["1,"], ["1,"]).Length.AssertEqual(0);
+
+		diffs([""], ["5"]).Length.AssertEqual(1);
+		diffs(["1"], ["1,2"]).Length.AssertEqual(1);
+		diffs([",2"], ["1,2"]).Length.AssertEqual(1);
+		diffs(["1,2"], ["1,"]).Length.AssertEqual(1);
+	}
+
+	// The row rule Check() runs on covers the union of both column sets, so neither a dropped nor an
+	// unexpected column can go unread.
+	[TestMethod]
+	public void RowDiffsAccountsForEveryExpectedColumn()
+	{
+		static int count(decimal?[] produced, decimal?[] reference)
+			=> IndicatorDataRunner.RowDiffs(produced, reference, 0.1m, 1).Count();
+
+		count([1m, 2m], [1m, 2m]).AssertEqual(0);
+		count([null, 2m], [null, 2m]).AssertEqual(0);
+		count([1m], [1.05m]).AssertEqual(0);
+
+		count([null, 2m], [1m, 2m]).AssertEqual(1);
+		count([], [1m]).AssertEqual(1);
+		count([1m], [1m, 2m]).AssertEqual(1);
+		count([1m, 2m], [1m]).AssertEqual(1);
+		count([1m], [5m]).AssertEqual(1);
+	}
 }
 
 static class IndicatorDataRunner
@@ -2453,13 +3061,55 @@ static class IndicatorDataRunner
 		};
 
 	/// <summary>
+	/// Splits one rendered or committed line into its columns, an empty field standing for no value.
+	/// </summary>
+	public static decimal?[] ParseRow(string row)
+	{
+		ArgumentNullException.ThrowIfNull(row);
+
+		return [.. row.SplitByComma().Select(c => c.IsEmpty() ? (decimal?)null : c.To<decimal>())];
+	}
+
+	/// <summary>
+	/// Lists the differences between one produced row and its reference row, over the union of both column
+	/// sets: a column the reference gives a value for and the run no longer produces is a difference, as is a
+	/// column the run produces and the reference does not have, as is a pair of values further apart than
+	/// <paramref name="epsilon"/>.
+	/// </summary>
+	/// <param name="produced">Produced columns, null standing for no value.</param>
+	/// <param name="reference">Reference columns, null standing for no value.</param>
+	/// <param name="epsilon">Comparison tolerance.</param>
+	/// <param name="line">1-based line number the messages carry.</param>
+	/// <returns>Difference descriptions, empty when the rows agree.</returns>
+	public static IEnumerable<string> RowDiffs(decimal?[] produced, decimal?[] reference, decimal epsilon, int line)
+	{
+		ArgumentNullException.ThrowIfNull(produced);
+		ArgumentNullException.ThrowIfNull(reference);
+
+		var count = produced.Length.Max(reference.Length);
+
+		for (var col = 0; col < count; col++)
+		{
+			var now = col < produced.Length ? produced[col] : null;
+			var was = col < reference.Length ? reference[col] : null;
+
+			if (now is null && was is null)
+				continue;
+			else if (now is null)
+				yield return $"line {line} column {col}: reference '{was}', now empty";
+			else if (was is null)
+				yield return $"line {line} column {col}: reference empty, now '{now}'";
+			else if ((was.Value - now.Value).Abs() >= epsilon)
+				yield return $"line {line} column {col}: reference '{was}', now '{now}'";
+		}
+	}
+
+	/// <summary>
 	/// Lists the differences between the committed reference lines and a fresh run that <see cref="Check{T}"/>
-	/// would actually trip over, applying its own reading rules: a row before the indicator is formed is never
-	/// looked at; a component that now comes out empty only has to face an empty or absent reference cell, and
-	/// only when the row is partially formed; a component that now has a value has to face a reference value
-	/// within the measure's epsilon; reference columns beyond the produced ones are never read.
-	/// Everything else - stale warm-up numbers, reference rows that stop short of today's column count - is
-	/// cosmetic drift that the pinned data is allowed to carry.
+	/// would also trip over, applying its own reading rules: a row before the indicator is formed is never
+	/// looked at, and from there on every row is compared through <see cref="RowDiffs"/> - over the union of
+	/// the produced and the reference columns, so a value the reference has and the run no longer produces is
+	/// reported rather than passed over.
 	/// </summary>
 	public static string[] ValidatedDiffs(this RenderedSeries rendered, string[] committed)
 	{
@@ -2472,39 +3122,13 @@ static class IndicatorDataRunner
 
 			for (var i = rendered.FormedFrom; i < rendered.Rows.Length; i++)
 			{
-				var produced = rendered.Rows[i].SplitByComma();
-
 				if (i >= committed.Length)
 				{
 					diffs.Add($"line {i + 1}: reference data ends, indicator still produces '{rendered.Rows[i]}'");
 					continue;
 				}
 
-				var reference = committed[i].SplitByComma();
-				var rowHasValue = produced.Any(c => !c.IsEmpty());
-
-				for (var col = 0; col < produced.Length; col++)
-				{
-					var now = produced[col];
-					var was = col < reference.Length ? reference[col] : null;
-
-					if (now.IsEmpty())
-					{
-						if (rowHasValue && !was.IsEmpty())
-							diffs.Add($"line {i + 1} column {col}: reference '{was}', now empty");
-
-						continue;
-					}
-
-					if (was.IsEmpty())
-					{
-						diffs.Add($"line {i + 1} column {col}: reference {(was is null ? "has no such column" : "empty")}, now '{now}'");
-						continue;
-					}
-
-					if ((was.To<decimal>() - now.To<decimal>()).Abs() >= rendered.Epsilon)
-						diffs.Add($"line {i + 1} column {col}: reference '{was}', now '{now}'");
-				}
+				diffs.AddRange(RowDiffs(ParseRow(rendered.Rows[i]), ParseRow(committed[i]), rendered.Epsilon, i + 1));
 			}
 
 			return diffs;
@@ -2558,54 +3182,22 @@ static class IndicatorDataRunner
 
 			nonFinalCount += numNonFinals;
 
-			void CheckValue(IIndicatorValue value, int column, bool rowHasValue)
-			{
-				if (!indicator.IsFormed)
-					return;
-
-				var data = values[values.Count - 1];
-
-				if (value.IsEmpty)
-				{
-					// Sound interior-empty contract: only when this final value is PARTIALLY
-					// formed (rowHasValue: at least one of its plain components is non-empty) does
-					// the reference row definitely span the non-empty columns, so an empty
-					// component at a lower column must map to a null reference cell (a value->Empty
-					// regression of one inner output would be caught here). For a fully empty
-					// (warm-up) value we skip the check: the reference row may be a blank line, and
-					// a few reference files (e.g. Shift.txt) carry a stale value on the warm-up bar
-					// - a reference-data quirk, not an engine regression. The column<Length guard
-					// also covers trailing-trimmed empties.
-					if (rowHasValue && column < data.Values.Length)
-						data.Values[column].AssertNull();
-				}
-				else
-				{
-					var testValue = data.Values[column];
-
-					testValue.AssertNotNull();
-
-					var indValue = value.ToDecimal().Round(2);
-
-					((testValue.Value - indValue).Abs() < epsilon).AssertTrue();
-				}
-			}
-
 			foreach (var inputValue in inputValues)
 			{
 				var value = indicator.Process(inputValue);
 
 				ValidateValue(value);
 
-				if (!inputValue.IsFinal)
+				if (!inputValue.IsFinal || !indicator.IsFormed)
 					continue;
 
-				var plain = value.Plain().ToArray();
-				var rowHasValue = plain.Any(sv => !sv.IsEmpty);
+				// Once formed, the whole reference row is answered for: every column it gives a value for
+				// has to come out of the run again, and every column the run produces has to be in it.
+				var row = values[values.Count - 1];
+				var produced = value.Plain().Select(sv => sv.IsEmpty ? (decimal?)null : sv.ToDecimal().Round(2)).ToArray();
+				var diffs = RowDiffs(produced, row.Values, epsilon, row.Line + 1).ToArray();
 
-				plain
-					.Select((sv, idx) => (v: sv, column: idx))
-					.ForEach(p => CheckValue(p.v, p.column, rowHasValue));
+				(diffs.Length == 0).AssertTrue($"{indicator}: {diffs.JoinN()}");
 			}
 		}
 

@@ -171,6 +171,56 @@ public class LatencyTests
 		mgr.LatencyCancellation.AssertEqual(TimeSpan.FromMilliseconds(8));
 	}
 
+	/// <summary>
+	/// A replace is one round trip, and the venue answers it once. Whatever else the manager files
+	/// away when the replace goes out, only that one answer is a measurement; if something is left
+	/// pending under the order's key, the order's ordinary later life - a fill, a finish - is read as
+	/// the answer to a cancellation that never happened, and the cancellation latency the trader
+	/// reads becomes the age of an order rather than the time a venue took to cancel one.
+	/// </summary>
+	[TestMethod]
+	[Timeout(5_000)]
+	public void ReplaceLeavesNoPendingCancellationForAnOrderNobodyCancelled()
+	{
+		var mgr = new LatencyManager(new LatencyManagerState());
+		var t0 = DateTime.UtcNow;
+
+		var replace = new OrderReplaceMessage
+		{
+			TransactionId = 300,
+			OriginalTransactionId = 200,
+			LocalTime = t0,
+		};
+
+		mgr.ProcessMessage(replace).AssertNull();
+
+		// The venue confirms the replaced order is working: this is the answer to the round trip.
+		var active = new ExecutionMessage
+		{
+			OriginalTransactionId = replace.TransactionId,
+			LocalTime = t0 + TimeSpan.FromMilliseconds(5),
+			OrderState = OrderStates.Active,
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+		};
+
+		mgr.ProcessMessage(active).AssertEqual(TimeSpan.FromMilliseconds(5));
+		mgr.LatencyRegistration.AssertEqual(TimeSpan.FromMilliseconds(5));
+
+		// Much later the order simply finishes - nobody cancelled it.
+		var done = new ExecutionMessage
+		{
+			OriginalTransactionId = replace.TransactionId,
+			LocalTime = t0 + TimeSpan.FromMilliseconds(500),
+			OrderState = OrderStates.Done,
+			DataTypeEx = DataType.Transactions,
+			HasOrderInfo = true,
+		};
+
+		mgr.ProcessMessage(done).AssertNull("an order finishing is not a cancellation being answered");
+		mgr.LatencyCancellation.AssertEqual(TimeSpan.Zero, "no cancellation was ever asked for, so there is no cancellation latency to report");
+	}
+
 	[TestMethod]
 	[Timeout(5_000)]
 	public void PendingExecutionIgnored()

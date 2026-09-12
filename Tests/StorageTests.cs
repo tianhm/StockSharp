@@ -417,6 +417,56 @@ public class StorageTests : BaseTestClass
 		loadedTrades.Length.AssertEqual(0);
 	}
 
+	/// <summary>
+	/// A delete names the records to remove. Records the caller never saved are not in the storage,
+	/// so nothing is removed and the day they fall on comes back whole - a day dropped because the
+	/// request happened to carry as many items as the day holds is silent, unrecoverable data loss.
+	/// </summary>
+	[TestMethod]
+	[DataRow(StorageFormats.Binary)]
+	[DataRow(StorageFormats.Csv)]
+	public async Task DeletingTicksThatWereNeverStoredLeavesTheDayWhole(StorageFormats format)
+	{
+		var security = Helper.CreateStorageSecurity();
+		var secId = security.ToSecurityId();
+		var token = CancellationToken;
+
+		var date = new DateTime(2025, 10, 1, 10, 0, 0, DateTimeKind.Utc);
+
+		ExecutionMessage CreateTick(DateTime serverTime, long tradeId) => new()
+		{
+			SecurityId = secId,
+			DataTypeEx = DataType.Ticks,
+			ServerTime = serverTime,
+			TradeId = tradeId,
+			TradePrice = 100 + tradeId,
+			TradeVolume = 1,
+		};
+
+		var stored = new[]
+		{
+			CreateTick(date.AddMinutes(0), 1),
+			CreateTick(date.AddMinutes(1), 2),
+			CreateTick(date.AddMinutes(2), 3),
+		};
+
+		var tradeStorage = GetTradeStorage(secId, format);
+
+		await tradeStorage.SaveAsync(stored, token);
+
+		// The same day and the same number of records, but not one of them was ever saved.
+		var foreign = new[]
+		{
+			CreateTick(date.AddHours(1), 11),
+			CreateTick(date.AddHours(1).AddMinutes(1), 12),
+			CreateTick(date.AddHours(1).AddMinutes(2), 13),
+		};
+
+		await tradeStorage.DeleteAsync(foreign, token);
+
+		await LoadTradesAndCompare(tradeStorage, stored, format);
+	}
+
 	[TestMethod]
 	[DataRow(StorageFormats.Binary)]
 	[DataRow(StorageFormats.Csv)]
@@ -2993,6 +3043,36 @@ public class StorageTests : BaseTestClass
 		}
 	}
 
+	/// <summary>
+	/// A snapshot file that cannot be read is a file to report, not a file to throw away. Reading is
+	/// not the moment to destroy the only copy of the data: a half-written file may still hold most
+	/// of the session, and once the reader has deleted it there is nothing left to repair or inspect.
+	/// </summary>
+	[TestMethod]
+	public void UnreadableSnapshotFileIsKept()
+	{
+		var fs = Helper.MemorySystem;
+		var path = fs.GetSubTemp();
+		var date = new DateTime(2025, 11, 3, 0, 0, 0, DateTimeKind.Utc);
+
+		var dir = Path.Combine(path, LocalMarketDataDrive.GetDirName(date));
+		fs.CreateDirectory(dir);
+
+		var fileName = Path.Combine(dir, "level1.bin");
+
+		// Version bytes, then a record that says it is ten bytes long and is not.
+		fs.WriteAllBytes(fileName, [1, 0, 10, 0, 0, 0, 1, 2, 3]);
+
+		using var registry = new SnapshotRegistry(fs, path);
+
+		var storage = ((ISnapshotRegistry)registry).GetSnapshotStorage(DataType.Level1);
+
+		// Reading is what trips over the damaged record.
+		storage.Get(new SecurityId { SecurityCode = "TEST", BoardCode = BoardCodes.Test });
+
+		fs.FileExists(fileName).AssertTrue("the snapshot file the reader could not parse has to still be there");
+	}
+
 	[TestMethod]
 	[DataRow(StorageFormats.Binary)]
 	[DataRow(StorageFormats.Csv)]
@@ -3542,6 +3622,56 @@ public class StorageTests : BaseTestClass
 		dataTypes.Count(d => d == DataType.Ticks).AssertEqual(1);
 		dataTypes.Count(d => d == DataType.Level1).AssertEqual(1);
 		dataTypes.Count(d => d == DataType.MarketDepth).AssertEqual(1);
+	}
+
+	/// <summary>
+	/// The format is part of the question, not a hint: asking a drive what it holds in csv must not be
+	/// answered with what it holds in binary. A listing that names data the format does not have sends
+	/// every export, replay and backtest built on it looking for files that are not there.
+	/// </summary>
+	[TestMethod]
+	public async Task AvailableDataTypesAreListedPerFormatForTheWholeDrive()
+	{
+		var drive = CreateDrive();
+		var securityId = new SecurityId { SecurityCode = "TEST", BoardCode = BoardCodes.Test };
+		var dates = new[] { DateTime.UtcNow.Date };
+		var token = CancellationToken;
+
+		await SetupTestDataAsync(drive, securityId, DataType.Ticks, StorageFormats.Binary, dates);
+
+		var binary = await drive.GetAvailableDataTypesAsync(default, StorageFormats.Binary).ToArrayAsync(token);
+		binary.Length.AssertEqual(1);
+		binary[0].AssertEqual(DataType.Ticks);
+
+		var csv = await drive.GetAvailableDataTypesAsync(default, StorageFormats.Csv).ToArrayAsync(token);
+		csv.Length.AssertEqual(0, "nothing was ever written to this drive in csv form");
+	}
+
+	/// <summary>
+	/// What a drive holds is on disk, and the answer to "what is there" has to come from there too.
+	/// A collector, another process or a restored backup writing into the same folder is the normal
+	/// way data arrives, and a listing answered from a cache that was filled once hides all of it.
+	/// </summary>
+	[TestMethod]
+	public async Task AvailableDataTypesIncludeWhatAppearedOnDiskAfterTheFirstQuestion()
+	{
+		var fs = Helper.MemorySystem;
+		var drive = CreateDrive();
+		var securityId = new SecurityId { SecurityCode = "TEST", BoardCode = BoardCodes.Test };
+		var date = DateTime.UtcNow.Date;
+		var token = CancellationToken;
+
+		// The first question is asked while the drive is still empty.
+		(await drive.GetAvailableDataTypesAsync(default, StorageFormats.Binary).ToArrayAsync(token)).Length.AssertEqual(0);
+
+		// Data appears in the folder the way it does when someone else collected it.
+		var dir = Path.Combine(drive.GetSecurityPath(securityId), LocalMarketDataDrive.GetDirName(date));
+		fs.CreateDirectory(dir);
+		fs.WriteAllBytes(Path.Combine(dir, LocalMarketDataDrive.GetFileName(DataType.Ticks, StorageFormats.Binary)), []);
+
+		var dataTypes = await drive.GetAvailableDataTypesAsync(default, StorageFormats.Binary).ToArrayAsync(token);
+
+		dataTypes.AssertContains(DataType.Ticks, "data that is on disk has to be listed");
 	}
 
 	[TestMethod]

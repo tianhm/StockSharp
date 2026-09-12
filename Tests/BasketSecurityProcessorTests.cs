@@ -1,4 +1,4 @@
-namespace StockSharp.Tests;
+﻿namespace StockSharp.Tests;
 
 /// <summary>
 /// Comprehensive tests for basket security processors.
@@ -183,6 +183,92 @@ public class BasketSecurityProcessorTests : BaseTestClass
 		result.Length.AssertEqual(0);
 	}
 
+	[TestMethod]
+	[DataRow(nameof(WeightedIndexSecurityProcessor))]
+	[DataRow(nameof(ExpressionIndexSecurityProcessor))]
+	public void IndexProcessor_Candles_ZeroPricesFilledFromClose(string processorName)
+	{
+		var lkoh = CreateTestSecurity("LKOH", "TQBR");
+		var sber = CreateTestSecurity("SBER", "TQBR");
+		var (basket, _) = CreateIndexBasket(processorName, lkoh, sber, weight1: 1, weight2: 2);
+		var processor = CreateProcessor(basket);
+
+		var openTime = new DateTime(2024, 1, 1, 10, 0, 0);
+
+		// Legs report the close only. The index candle backfills its zero prices from the
+		// single non-zero one, so the close must reach open/high/low as well.
+		processor.Process(CreateCandle(lkoh, openTime, open: 0m, high: 0m, low: 0m, close: 105m, volume: 1000m)).ToArray();
+		var result = processor.Process(CreateCandle(sber, openTime, open: 0m, high: 0m, low: 0m, close: 52m, volume: 2000m)).ToArray();
+
+		result.Length.AssertEqual(1);
+		var indexCandle = (CandleMessage)result[0];
+
+		// Close = 105 * 1 + 52 * 2 = 209.
+		indexCandle.ClosePrice.AssertEqual(209m);
+		indexCandle.OpenPrice.AssertEqual(209m);
+		indexCandle.HighPrice.AssertEqual(209m);
+		indexCandle.LowPrice.AssertEqual(209m);
+	}
+
+	[TestMethod]
+	[DataRow(nameof(WeightedIndexSecurityProcessor))]
+	[DataRow(nameof(ExpressionIndexSecurityProcessor))]
+	public void IndexProcessor_FillGapsByZeros_MissingLegCountsAsZero(string processorName)
+	{
+		var lkoh = CreateTestSecurity("LKOH", "TQBR");
+		var sber = CreateTestSecurity("SBER", "TQBR");
+		var (basket, _) = CreateIndexBasket(processorName, lkoh, sber, weight1: 1, weight2: 2);
+		((IndexSecurity)basket).FillGapsByZeros = true;
+		var processor = CreateProcessor(basket);
+
+		var time1 = new DateTime(2024, 1, 1, 10, 0, 0);
+		var time2 = time1.AddMinutes(1);
+
+		// SBER misses the first minute. FillGapsByZeros means that gap counts as a zero
+		// value, so the bucket still yields an index candle built from LKOH alone.
+		processor.Process(CreateCandle(lkoh, time1, open: 100m, high: 110m, low: 95m, close: 105m, volume: 1000m)).ToArray();
+		processor.Process(CreateCandle(lkoh, time2, open: 100m, high: 110m, low: 95m, close: 105m, volume: 1000m)).ToArray();
+
+		var result = processor.Process(CreateCandle(sber, time2, open: 50m, high: 55m, low: 48m, close: 52m, volume: 2000m)).ToArray();
+
+		result.Length.AssertEqual(2);
+
+		var gapCandle = (CandleMessage)result[0];
+		gapCandle.OpenTime.AssertEqual(time1);
+
+		// Missing SBER contributes zero: 100 * 1 + 0 * 2 = 100, and so on for the rest.
+		gapCandle.OpenPrice.AssertEqual(100m);
+		gapCandle.HighPrice.AssertEqual(110m);
+		gapCandle.LowPrice.AssertEqual(95m);
+		gapCandle.ClosePrice.AssertEqual(105m);
+
+		var fullCandle = (CandleMessage)result[1];
+		fullCandle.OpenTime.AssertEqual(time2);
+		fullCandle.OpenPrice.AssertEqual(200m);
+		fullCandle.HighPrice.AssertEqual(220m);
+		fullCandle.LowPrice.AssertEqual(191m);
+		fullCandle.ClosePrice.AssertEqual(209m);
+	}
+
+	[TestMethod]
+	public void IndexProcessor_KeepsIndexSettings()
+	{
+		var (basket, _, _) = CreateWeightedBasket(lkohWeight: 1, sberWeight: 2);
+
+		var index = (IndexSecurity)basket;
+		index.FillGapsByZeros = true;
+		index.IgnoreErrors = true;
+		index.CalculateExtended = true;
+
+		var processor = (WeightedIndexSecurityProcessor)CreateProcessor(basket);
+
+		// The processor rebuilds its own copy of the index security; the options that drive
+		// gap filling, error tolerance and extended fields must survive that copy.
+		processor.BasketSecurity.FillGapsByZeros.AssertTrue();
+		processor.BasketSecurity.IgnoreErrors.AssertTrue();
+		processor.BasketSecurity.CalculateExtended.AssertTrue();
+	}
+
 	#endregion
 
 	#region Parameterized Continuous Processor Tests
@@ -247,6 +333,45 @@ public class BasketSecurityProcessorTests : BaseTestClass
 			active4.SecurityId.AssertEqual(basketId);
 			active4.TradePrice.AssertEqual(101000m); // switched: RIZ8 is now the active leg
 		}
+	}
+
+	/// <summary>
+	/// A continuous security is one contract at a time. When the front contract expires the next one
+	/// takes over - but only that one: a trade in a contract further out is still not the continuous
+	/// security's trade, and passing it on writes a price from another instrument into the series.
+	/// </summary>
+	[TestMethod]
+	[Timeout(5_000, CooperativeCancellation = true)]
+	public void ContinuousProcessor_AfterExpiration_OnlyTheNextContractPasses()
+	{
+		var riu = CreateFuture("RIU8", new DateTime(2024, 9, 15));
+		var riz = CreateFuture("RIZ8", new DateTime(2024, 12, 15));
+		var rih = CreateFuture("RIH9", new DateTime(2025, 3, 15));
+
+		var basket = new ExpirationContinuousSecurity
+		{
+			Id = "RI@FORTS",
+			Board = ExchangeBoard.Forts,
+		};
+
+		foreach (var leg in new[] { riu, riz, rih })
+			basket.ExpirationJumps.Add(leg.ToSecurityId(), leg.ExpiryDate!.Value);
+
+		var processor = CreateProcessor(basket);
+
+		var beforeExpiry = new DateTime(2024, 9, 10);
+
+		processor.Process(CreateTick(riu, beforeExpiry, price: 100000m, volume: 100m)).ToArray()
+			.Length.AssertEqual(1, "the front contract is the series while it lives");
+
+		// The front contract has expired, so the series is RIZ8 now. RIH9 is two contracts out.
+		var afterExpiry = new DateTime(2024, 9, 16);
+
+		processor.Process(CreateTick(rih, afterExpiry, price: 111000m, volume: 5m)).ToArray()
+			.Length.AssertEqual(0, "a trade in a contract further out is not the continuous security's trade");
+
+		processor.Process(CreateTick(riz, afterExpiry, price: 101000m, volume: 80m)).ToArray()
+			.Length.AssertEqual(1, "and the contract that did take over still is");
 	}
 
 	[TestMethod]
@@ -424,6 +549,50 @@ public class BasketSecurityProcessorTests : BaseTestClass
 
 		rizBook.Length.AssertEqual(1);
 		((QuoteChangeMessage)rizBook[0]).SecurityId.AssertEqual(basket.ToSecurityId());
+	}
+
+	[TestMethod]
+	[DataRow(nameof(ContinuousSecurityExpirationProcessor))]
+	[DataRow(nameof(ContinuousSecurityVolumeProcessor))]
+	public void ContinuousProcessor_Level1AndNews_DoNotBreakProcessing(string processorName)
+	{
+		var riu = CreateFuture("RIU8", new DateTime(2024, 9, 15));
+		var riz = CreateFuture("RIZ8", new DateTime(2024, 12, 15));
+		var other = CreateTestSecurity("OTHER", "FORTS");
+
+		var basket = CreateContinuousBasket(processorName, riu, riz);
+		var processor = CreateProcessor(basket);
+
+		var time = new DateTime(2024, 9, 10);
+
+		// BasketSecurityMessageAdapter feeds every subscription message of a leg into Process,
+		// so a level1 subscription on a continuous security must not blow up the out pipeline.
+		var legLevel1 = processor.Process(new Level1ChangeMessage
+		{
+			SecurityId = riu.ToSecurityId(),
+			ServerTime = time,
+		}.TryAdd(Level1Fields.LastTradePrice, 100000m)).ToArray();
+
+		// Whether level1 is forwarded or dropped is open, but anything emitted is the basket's.
+		foreach (var msg in legLevel1)
+			((ISecurityIdMessage)msg).SecurityId.AssertEqual(basket.ToSecurityId());
+
+		// A security outside the basket is ignored everywhere else - level1 is no exception.
+		var alienLevel1 = processor.Process(new Level1ChangeMessage
+		{
+			SecurityId = other.ToSecurityId(),
+			ServerTime = time,
+		}.TryAdd(Level1Fields.LastTradePrice, 50000m)).ToArray();
+
+		alienLevel1.Length.AssertEqual(0);
+
+		// News carries no leg id at all and must simply pass by, not throw.
+		processor.Process(new NewsMessage
+		{
+			Id = "news-1",
+			Headline = "Test",
+			ServerTime = time,
+		}).ToArray();
 	}
 
 	#endregion
@@ -773,6 +942,101 @@ public class BasketSecurityProcessorTests : BaseTestClass
 		basketTick.SecurityId.AssertEqual(basket.ToSecurityId());
 	}
 
+	/// <summary>
+	/// Legs with different spreads make an index quote a bid above its own ask. Whatever the
+	/// processor does about that, what it hands out must still be a book: a consumer reading the
+	/// touch of a crossed index sees a spread that appears to pay it to trade both sides.
+	/// </summary>
+	[TestMethod]
+	public void WeightedIndex_CrossedLegs_BestBidDoesNotExceedBestAsk()
+	{
+		// LKOH (+1) quotes a one-point spread, SBER (-1) a ten-point one, so subtracting SBER
+		// lifts the index bid (200 - 100 = 100) above the index ask (201 - 110 = 91).
+		var (basket, lkoh, sber) = CreateWeightedBasket(lkohWeight: 1, sberWeight: -1);
+		var processor = CreateProcessor(basket);
+
+		var serverTime = DateTime.UtcNow;
+
+		processor.Process(CreateOrderBook(lkoh, serverTime,
+			bids: [(200m, 30m)],
+			asks: [(201m, 30m)])).ToArray();
+
+		var result = processor.Process(CreateOrderBook(sber, serverTime,
+			bids: [(100m, 10m)],
+			asks: [(110m, 10m)])).ToArray();
+
+		result.Length.AssertEqual(1);
+		var basketDepth = (QuoteChangeMessage)result[0];
+
+		(basketDepth.Bids[0].Price <= basketDepth.Asks[0].Price).AssertTrue("an index must not quote a bid above its own ask");
+		basketDepth.Verify().AssertTrue("the index must publish a well-formed order book");
+	}
+
+	/// <summary>
+	/// Depth is only readable best first: a consumer takes Bids[0]/Asks[0] as the touch and walks
+	/// outwards from there. An index that returns a side sorted the wrong way round makes every
+	/// such walk start at the worst price and call it the best one.
+	/// </summary>
+	[TestMethod]
+	public void WeightedIndex_CrossedLegs_BidsStayDescendingAndAsksAscending()
+	{
+		var (basket, lkoh, sber) = CreateWeightedBasket(lkohWeight: 1, sberWeight: -1);
+		var processor = CreateProcessor(basket);
+
+		var serverTime = DateTime.UtcNow;
+
+		// Index bids: 200 - 100 = 100 and 198 - 95 = 103.
+		// Index asks: 201 - 110 = 91 and 203 - 111 = 92.
+		// The best bid (103) lands above the best ask (91), so the index book arrives crossed.
+		processor.Process(CreateOrderBook(lkoh, serverTime,
+			bids: [(200m, 30m), (198m, 40m)],
+			asks: [(201m, 30m), (203m, 40m)])).ToArray();
+
+		var result = processor.Process(CreateOrderBook(sber, serverTime,
+			bids: [(100m, 10m), (95m, 12m)],
+			asks: [(110m, 10m), (111m, 12m)])).ToArray();
+
+		result.Length.AssertEqual(1);
+		var basketDepth = (QuoteChangeMessage)result[0];
+
+		basketDepth.Bids.Length.AssertEqual(2);
+		basketDepth.Asks.Length.AssertEqual(2);
+
+		(basketDepth.Bids[0].Price > basketDepth.Bids[1].Price).AssertTrue("bids must run from the best price downwards");
+		(basketDepth.Asks[0].Price < basketDepth.Asks[1].Price).AssertTrue("asks must run from the best price upwards");
+		basketDepth.Verify().AssertTrue("the index must publish a well-formed order book");
+	}
+
+	/// <summary>
+	/// A weighted index is a set of (security, weight) pairs, and the order they happen to be stored
+	/// in is not part of what the user asked for. An index that pairs a leg with whichever weight now
+	/// sits at that position publishes a different instrument's price under the same security id, and
+	/// nothing in the result says so.
+	/// </summary>
+	[TestMethod]
+	public void WeightedIndex_ReorderedWeights_EachLegKeepsItsOwnWeight()
+	{
+		var (basket, lkoh, sber) = CreateWeightedBasket(lkohWeight: 1, sberWeight: -1);
+		var processor = new WeightedIndexSecurityProcessor(basket);
+
+		// The very same securities with the very same weights, stored the other way round.
+		var weights = processor.BasketSecurity.Weights;
+		weights.Clear();
+		weights[sber.ToSecurityId()] = -1;
+		weights[lkoh.ToSecurityId()] = 1;
+
+		var serverTime = DateTime.UtcNow;
+
+		processor.Process(CreateTick(lkoh, serverTime, price: 100m, volume: 10m)).ToArray();
+		var result = processor.Process(CreateTick(sber, serverTime, price: 30m, volume: 5m)).ToArray();
+
+		result.Length.AssertEqual(1);
+		var basketTick = (ExecutionMessage)result[0];
+
+		// LKOH keeps its +1 and SBER its -1: 100 - 30 = 70.
+		basketTick.TradePrice.AssertEqual(70m, "each leg must be multiplied by the weight configured for that security");
+	}
+
 	#endregion
 
 	#region ExpressionIndexSecurity Specific Tests
@@ -826,6 +1090,48 @@ public class BasketSecurityProcessorTests : BaseTestClass
 
 		// Price = 100 / 50 = 2
 		basketTick.TradePrice.AssertEqual(2m);
+	}
+
+	/// <summary>
+	/// A formula that does not compile is still the formula the user typed: it has to be shown back
+	/// to them to be corrected, and it has to survive being saved and reloaded. An index that answers
+	/// nothing when asked what its formula is has thrown that work away, and the only trace left of
+	/// it is a log line.
+	/// </summary>
+	[TestMethod]
+	public void ExpressionIndex_UncompilableFormula_KeepsTheTextItWasGiven()
+	{
+		const string formula = "LKOH@TQBR +";
+
+		var basket = new ExpressionIndexSecurity
+		{
+			Id = "LKOH_BROKEN_EXP@TQBR",
+			Board = ExchangeBoard.MicexTqbr,
+			Expression = formula,
+		};
+
+		basket.Expression.AssertEqual(formula, "the text of a formula that failed to compile must stay readable");
+		basket.BasketExpression.AssertEqual(formula, "a security that serializes back to nothing cannot be saved");
+	}
+
+	/// <summary>
+	/// An index that could not compile its formula cannot calculate anything. Handing out a processor
+	/// for it would create a subscription that silently never publishes a value, so the caller is
+	/// entitled to hear about the broken formula at the moment it asks for the processor.
+	/// </summary>
+	[TestMethod]
+	public void ExpressionIndex_UncompilableFormula_RefusesToBuildAProcessor()
+	{
+		var basket = new ExpressionIndexSecurity
+		{
+			Id = "LKOH_BROKEN_EXP@TQBR",
+			Board = ExchangeBoard.MicexTqbr,
+			Expression = "LKOH@TQBR +",
+		};
+
+		basket.Formula.Error.IsEmpty().AssertFalse("an index that could not compile its formula must report that it cannot calculate");
+
+		ThrowsExactly<ArgumentException>(() => new ExpressionIndexSecurityProcessor(basket), "an index with no legs to subscribe to must not produce a processor");
 	}
 
 	#endregion

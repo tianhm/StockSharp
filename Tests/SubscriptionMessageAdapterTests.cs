@@ -262,4 +262,69 @@ public class SubscriptionMessageAdapterTests : BaseTestClass
 	}
 
 	#endregion
+
+	#region The adapter's own clock
+
+	// Runs on a clock the test sets and writes down whether it was actually asked to subscribe.
+	// Nothing above MarketDataAsync is overridden, because the base adapter's own decision about a
+	// range that has not happened yet is what is under test.
+	private sealed class ClockedAdapter : MessageAdapter
+	{
+		public ClockedAdapter()
+			: base(new IncrementalIdGenerator())
+		{
+		}
+
+		/// <summary>The time this adapter believes it is.</summary>
+		public DateTime Now { get; set; }
+
+		public List<MarketDataMessage> Subscribed { get; } = [];
+
+		public override DateTime CurrentTime => Now;
+
+		protected override ValueTask OnTicksSubscriptionAsync(MarketDataMessage mdMsg, CancellationToken cancellationToken)
+		{
+			Subscribed.Add(mdMsg);
+			return SendSubscriptionReplyAsync(mdMsg.TransactionId, cancellationToken);
+		}
+
+		public override IMessageAdapter Clone() => new ClockedAdapter { Now = Now };
+	}
+
+	/// <summary>
+	/// Whether a requested range lies in the future is decided against the adapter's own clock. In an
+	/// emulation that clock is the simulated one, and a strategy asking for data ahead of where the
+	/// simulation has got to is entitled to be told there is nothing there yet - rather than having
+	/// the request accepted against wall-clock time and answered with whatever the feed has.
+	/// </summary>
+	[TestMethod]
+	public async Task MarketData_FromInTheFuture_IsJudgedByTheAdapterClock()
+	{
+		var adapter = new ClockedAdapter
+		{
+			Now = new DateTime(2020, 03, 04, 09, 30, 00, DateTimeKind.Utc),
+		};
+
+		var output = new List<Message>();
+		adapter.NewOutMessageAsync += (m, _) => { output.Add(m); return default; };
+
+		var from = adapter.Now.AddDays(30);
+
+		await adapter.SendInMessageAsync(new MarketDataMessage
+		{
+			IsSubscribe = true,
+			TransactionId = 1,
+			SecurityId = Helper.CreateSecurityId(),
+			DataType2 = DataType.Ticks,
+			From = from,
+			To = from.AddDays(1),
+		}, CancellationToken);
+
+		IsEmpty(adapter.Subscribed, "the range has not happened yet on this adapter's clock, so there is nothing to go and ask for");
+
+		output.OfType<SubscriptionFinishedMessage>().Count(m => m.OriginalTransactionId == 1)
+			.AssertEqual(1, "and the caller is told the request is done instead of being left waiting for data that cannot come");
+	}
+
+	#endregion
 }

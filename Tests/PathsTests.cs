@@ -136,6 +136,7 @@ public class PathsTests : BaseTestClass
 	}
 
 	[TestMethod]
+	[DoNotParallelize]
 	public void SiteAddresses_FollowTheLanguage()
 	{
 		// One test rather than three: the language is global state, and separate tests mutating it race each

@@ -733,4 +733,165 @@ public class StorageMetaInfoMessageAdapterTests : BaseTestClass
 	}
 
 	#endregion
+
+	#region Meta-Info Write-Through Tests
+
+	private static readonly SecurityId _msft = new() { SecurityCode = "MSFT", BoardCode = "NASDAQ" };
+
+	private static (StorageMetaInfoMessageAdapter adapter,
+		RecordingMessageAdapter inner,
+		InMemorySecurityStorage secStorage,
+		InMemoryPositionStorage posStorage,
+		List<Message> heard) CreateConnectedAdapter()
+	{
+		var inner = new RecordingMessageAdapter();
+		var secStorage = new InMemorySecurityStorage();
+		var posStorage = new InMemoryPositionStorage();
+
+		var adapter = new StorageMetaInfoMessageAdapter(inner, secStorage, posStorage, new InMemoryExchangeInfoProvider(), new TestStorageProcessor());
+
+		var heard = new List<Message>();
+		((IMessageAdapter)adapter).NewOutMessageAsync += (m, ct) => { heard.Add(m); return default; };
+
+		return (adapter, inner, secStorage, posStorage, heard);
+	}
+
+	/// <summary>
+	/// A portfolio subscription answered out of the meta-info storage replays what was recorded
+	/// earlier, so every row has to carry the time it was last changed. Stamped with the moment of
+	/// the lookup instead, a position nobody has touched for a week claims to have moved just now,
+	/// and the subscriber has no other field left to learn the truth from.
+	/// </summary>
+	[TestMethod]
+	public async Task PortfolioLookup_FromStorage_KeepsTheStoredServerTime()
+	{
+		var (adapter, _, secStorage, posStorage, heard) = CreateConnectedAdapter();
+
+		var lastChange = new DateTime(2025, 3, 4, 9, 30, 0, DateTimeKind.Utc);
+
+		var portfolio = new Portfolio
+		{
+			Name = "PF1",
+			BeginValue = 100000,
+			CurrentValue = 110000,
+			ServerTime = lastChange,
+		};
+
+		posStorage.Save(portfolio);
+
+		var security = new Security { Id = "MSFT@NASDAQ", Code = "MSFT", Board = ExchangeBoard.Nasdaq };
+		await secStorage.SaveAsync(security, false, CancellationToken);
+
+		posStorage.Save(new Position
+		{
+			Portfolio = portfolio,
+			Security = security,
+			CurrentValue = 10,
+			ServerTime = lastChange,
+		});
+
+		await adapter.SendInMessageAsync(new PortfolioLookupMessage { TransactionId = 7, IsSubscribe = true }, CancellationToken);
+
+		var posMsg = heard.OfType<PositionChangeMessage>().FirstOrDefault(m => m.SecurityId == _msft);
+		IsNotNull(posMsg, "the position held in storage is replayed to the subscription");
+		AreEqual(lastChange, posMsg.ServerTime, "the replayed position carries the time it was last changed, not the time of the lookup");
+
+		var moneyMsg = heard.OfType<PositionChangeMessage>().FirstOrDefault(m => m.SecurityId == SecurityId.Money);
+		IsNotNull(moneyMsg, "so is the money the portfolio holds");
+		AreEqual(lastChange, moneyMsg.ServerTime, "and it keeps its own recorded time too");
+	}
+
+	/// <summary>
+	/// What the meta-info storage already knows answers a portfolio subscription straight away,
+	/// addressed to the subscription that asked, and the lookup still goes on to the connection - so
+	/// the subscriber sees the last known state at once and the live state as soon as it arrives,
+	/// rather than one instead of the other.
+	/// </summary>
+	[TestMethod]
+	public async Task PortfolioLookup_FromStorage_AnswersWithWhatItHoldsAndStillAsksTheConnection()
+	{
+		var (adapter, inner, secStorage, posStorage, heard) = CreateConnectedAdapter();
+
+		var portfolio = new Portfolio { Name = "PF1", BeginValue = 100000, CurrentValue = 110000 };
+		posStorage.Save(portfolio);
+
+		var security = new Security { Id = "MSFT@NASDAQ", Code = "MSFT", Board = ExchangeBoard.Nasdaq };
+		await secStorage.SaveAsync(security, false, CancellationToken);
+
+		posStorage.Save(new Position
+		{
+			Portfolio = portfolio,
+			Security = security,
+			CurrentValue = 10,
+		});
+
+		await adapter.SendInMessageAsync(new PortfolioLookupMessage { TransactionId = 7, IsSubscribe = true }, CancellationToken);
+
+		var pfMsg = heard.OfType<PortfolioMessage>().FirstOrDefault(m => m.PortfolioName == "PF1");
+		IsNotNull(pfMsg, "the portfolio held in storage answers the lookup on its own");
+		AreEqual(7L, pfMsg.SubscriptionId, "and is addressed to the subscription that asked for it");
+
+		var posMsg = heard.OfType<PositionChangeMessage>().FirstOrDefault(m => m.SecurityId == _msft);
+		IsNotNull(posMsg, "so does the position it holds");
+		AreEqual(7L, posMsg.SubscriptionId);
+		AreEqual<decimal?>(10m, posMsg.TryGetDecimal(PositionChangeTypes.CurrentValue), "with the value that was recorded for it");
+
+		HasCount(1, inner.InMessages.OfType<PortfolioLookupMessage>().ToArray(), "the lookup still reaches the connection: storage answers first, it does not answer instead");
+	}
+
+	/// <summary>
+	/// A security the connection reports is written down as it passes, so the next session knows the
+	/// instrument without having to look it up again - and the message still reaches whoever was
+	/// listening, because recording it is not the same as consuming it.
+	/// </summary>
+	[TestMethod]
+	public async Task Security_FromTheConnection_IsWrittenDownAndStillPassedOn()
+	{
+		var (_, inner, secStorage, _, heard) = CreateConnectedAdapter();
+
+		await inner.SendOutMessageAsync(new SecurityMessage
+		{
+			SecurityId = _msft,
+			Name = "Microsoft",
+			PriceStep = 0.01m,
+		}, CancellationToken);
+
+		var stored = await secStorage.LookupByIdAsync(_msft, CancellationToken);
+
+		IsNotNull(stored, "a security the connection reported is written down without anyone asking for it");
+		AreEqual("Microsoft", stored.Name);
+		AreEqual<decimal?>(0.01m, stored.PriceStep);
+
+		IsNotNull(heard.OfType<SecurityMessage>().FirstOrDefault(m => m.SecurityId == _msft), "and still reaches whoever was listening for it");
+	}
+
+	/// <summary>
+	/// A position can be reported for an instrument and an account nobody has looked up yet. Both are
+	/// created and written down so that the position has something to hang on, otherwise the very
+	/// first report of a holding would be dropped for want of a security row.
+	/// </summary>
+	[TestMethod]
+	public async Task PositionChange_ForAnUnknownSecurity_CreatesWhatItNeedsAndStoresThePosition()
+	{
+		var (_, inner, secStorage, posStorage, _) = CreateConnectedAdapter();
+
+		await inner.SendOutMessageAsync(new PositionChangeMessage
+		{
+			SecurityId = _msft,
+			PortfolioName = "PF1",
+			ServerTime = new DateTime(2025, 3, 4, 9, 30, 0, DateTimeKind.Utc),
+		}.Add(PositionChangeTypes.CurrentValue, 5m), CancellationToken);
+
+		var security = await secStorage.LookupByIdAsync(_msft, CancellationToken);
+		IsNotNull(security, "the instrument the position speaks of is created rather than the position being dropped");
+
+		var portfolio = posStorage.LookupByPortfolioName("PF1");
+		IsNotNull(portfolio, "and so is the account it belongs to");
+
+		var position = posStorage.GetPosition(portfolio, security, null, null);
+		IsNotNull(position, "the position itself is written down");
+		AreEqual<decimal?>(5m, position.CurrentValue, "with the value that was reported");
+	}
+
+	#endregion
 }

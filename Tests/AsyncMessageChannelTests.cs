@@ -1,5 +1,6 @@
 namespace StockSharp.Tests;
 
+using System.Diagnostics;
 using System.Threading.Tasks.Sources;
 
 [TestClass]
@@ -74,6 +75,28 @@ public class AsyncMessageChannelTests : BaseTestClass
 	{
 		var completed = await Task.WhenAny(task, Task.Delay(timeout, cancellationToken));
 		(completed == task).AssertFalse();
+	}
+
+	private static async Task AssertCompleted(Task task, TimeSpan timeout, string message, CancellationToken cancellationToken)
+	{
+		var completed = await Task.WhenAny(task, Task.Delay(timeout, cancellationToken));
+
+		IsTrue(completed == task, message);
+
+		await task;
+	}
+
+	private static async Task<TimeSpan> MeasureProcessCpuAsync(TimeSpan window, CancellationToken cancellationToken)
+	{
+		static TimeSpan cpu()
+		{
+			using var proc = Process.GetCurrentProcess();
+			return proc.TotalProcessorTime;
+		}
+
+		var start = cpu();
+		await Task.Delay(window, cancellationToken);
+		return cpu() - start;
 	}
 
 	[TestMethod]
@@ -1241,6 +1264,91 @@ public class AsyncMessageChannelTests : BaseTestClass
 
 	#endregion
 
+	#region Reset Tests
+
+	// A reset cancels every live subscription while each subscription's own cleanup disposes the
+	// same token source. The reset must survive that overlap: it has to reach the adapter and hand
+	// the channel back usable, not leave the disconnecting flag set and drop everything after it.
+	[TestMethod]
+	[Timeout(30_000, CooperativeCancellation = true)]
+	public async Task Reset_WithLiveSubscriptions_LeavesChannelUsable()
+	{
+		const int subscriptionCount = 16;
+		const long firstTransactionId = 100;
+
+		var adapter = new PassThroughMessageAdapter(new IncrementalIdGenerator())
+		{
+			MaxParallelMessages = subscriptionCount + 2
+		};
+
+		using var channel = new AsyncMessageChannel(adapter);
+
+		var connected = AsyncHelper.CreateTaskCompletionSource<bool>();
+		var reconnected = AsyncHelper.CreateTaskCompletionSource<bool>();
+		var resetDone = AsyncHelper.CreateTaskCompletionSource<bool>();
+		var pingDone = AsyncHelper.CreateTaskCompletionSource<bool>();
+
+		var started = new TaskCompletionSource<bool>[subscriptionCount];
+
+		for (var i = 0; i < started.Length; i++)
+			started[i] = AsyncHelper.CreateTaskCompletionSource<bool>();
+
+		channel.NewOutMessageAsync += async (message, token) =>
+		{
+			switch (message)
+			{
+				case ConnectMessage:
+					if (!connected.TrySetResult(true))
+						reconnected.TrySetResult(true);
+
+					return;
+
+				case ResetMessage:
+					resetDone.TrySetResult(true);
+					return;
+
+				case TimeMessage:
+					pingDone.TrySetResult(true);
+					return;
+
+				case MarketDataMessage { IsSubscribe: true } subMsg:
+					started[subMsg.TransactionId - firstTransactionId].TrySetResult(true);
+					await Task.Delay(Timeout.Infinite, token);
+					return;
+			}
+		};
+
+		channel.Open();
+		await channel.SendInMessageAsync(new ConnectMessage(), CancellationToken);
+		await connected.Task.WithCancellation(CancellationToken);
+
+		for (var i = 0; i < started.Length; i++)
+		{
+			await channel.SendInMessageAsync(new MarketDataMessage
+			{
+				IsSubscribe = true,
+				TransactionId = firstTransactionId + i,
+				DataType2 = DataType.Level1,
+				SecurityId = new SecurityId { SecurityCode = "TEST", BoardCode = BoardCodes.Test },
+			}, CancellationToken);
+		}
+
+		await Task.WhenAll(started.Select(t => t.Task)).WithCancellation(CancellationToken);
+
+		await channel.SendInMessageAsync(new ResetMessage(), CancellationToken);
+
+		await AssertCompleted(resetDone.Task, TimeSpan.FromSeconds(5), "reset never reached the adapter: subscription cleanup threw out of it.", CancellationToken);
+
+		// A reset drops the connection, so restore it before checking that ordinary messages flow.
+		await channel.SendInMessageAsync(new ConnectMessage(), CancellationToken);
+		await AssertCompleted(reconnected.Task, TimeSpan.FromSeconds(5), "channel refused to connect after a reset: it still counts itself connected.", CancellationToken);
+
+		await channel.SendInMessageAsync(new TimeMessage(), CancellationToken);
+		await AssertCompleted(pingDone.Task, TimeSpan.FromSeconds(5), "channel dropped a message after a reset: the disconnecting flag is still set.", CancellationToken);
+	}
+
+	#endregion
+
 	#region Error Handling Tests
 
 	[TestMethod]
@@ -1389,6 +1497,54 @@ public class AsyncMessageChannelTests : BaseTestClass
 
 		channel.Resume();
 		await messageProcessed.Task.WithCancellation(CancellationToken);
+	}
+
+	// A message posted to a suspended channel leaves the processing wait handle set. The processor
+	// loop must park on the handle again instead of spinning a core until the channel resumes.
+	[TestMethod]
+	[DoNotParallelize] // CPU time is measured for the whole process.
+	[Timeout(30_000, CooperativeCancellation = true)]
+	public async Task Suspend_DoesNotBusySpin()
+	{
+		var adapter = new PassThroughMessageAdapter(new IncrementalIdGenerator())
+		{
+			MaxParallelMessages = 2
+		};
+
+		using var channel = new AsyncMessageChannel(adapter);
+
+		var connected = AsyncHelper.CreateTaskCompletionSource<bool>();
+
+		channel.NewOutMessageAsync += (message, token) =>
+		{
+			if (message is ConnectMessage)
+				connected.TrySetResult(true);
+
+			return default;
+		};
+
+		channel.Open();
+		await channel.SendInMessageAsync(new ConnectMessage(), CancellationToken);
+		await connected.Task.WithCancellation(CancellationToken);
+
+		var window = TimeSpan.FromMilliseconds(500);
+
+		// The processor is parked here, so this window carries only whatever else the host does;
+		// it is the baseline the suspended window is measured against.
+		var idle = await MeasureProcessCpuAsync(window, CancellationToken);
+
+		channel.Suspend();
+		channel.State.AssertEqual(ChannelStates.Suspended);
+
+		await channel.SendInMessageAsync(new ExecutionMessage(), CancellationToken);
+
+		var suspended = await MeasureProcessCpuAsync(window, CancellationToken);
+
+		channel.Resume();
+
+		var burnt = suspended - idle;
+
+		IsLess(burnt, window / 2, $"suspended channel burns CPU: {burnt.TotalMilliseconds:0} ms on top of the idle baseline {idle.TotalMilliseconds:0} ms over a {window.TotalMilliseconds:0} ms window.");
 	}
 
 	#endregion

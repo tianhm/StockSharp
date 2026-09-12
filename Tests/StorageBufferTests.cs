@@ -562,6 +562,19 @@ public class StorageBufferTests : BaseTestClass
 		result.Count.AssertEqual(1);
 	}
 
+	// EnabledTransactions says whether transactions are stored, the same way EnabledLevel1 and
+	// EnabledOrderBook do for their kinds; it is not a sub-setting of FilterSubscription.
+	[TestMethod]
+	public void ProcessOutMessage_Transaction_NotBufferedWhenDisabled()
+	{
+		var buffer = new StorageBuffer { EnabledTransactions = false };
+		var secId = CreateSecurityId();
+
+		buffer.ProcessOutMessage(CreateTransaction(secId, DateTime.UtcNow, 123));
+
+		buffer.GetTransactions().Count.AssertEqual(0, "transactions are turned off, so none is kept");
+	}
+
 	#endregion
 
 	#region ProcessOutMessage - PositionChange Tests
@@ -635,6 +648,38 @@ public class StorageBufferTests : BaseTestClass
 		buffer.GetLevel1().Count.AssertEqual(0);
 		buffer.GetOrderBooks().Count.AssertEqual(0);
 		buffer.GetNews().Count().AssertEqual(0);
+	}
+
+	// Reset drops what was accumulated before the connection restarted; a board state is
+	// accumulated data like any other and must not survive into the new session.
+	[TestMethod]
+	public void ProcessInMessage_Reset_ClearsBoardStates()
+	{
+		var buffer = new StorageBuffer();
+
+		buffer.ProcessOutMessage(CreateBoardState("TQBR", SessionStates.Active, DateTime.UtcNow));
+
+		buffer.ProcessInMessage(new ResetMessage());
+
+		buffer.GetBoardStates().Count().AssertEqual(0, "reset clears every buffer, board states included");
+	}
+
+	// What reset clears also stops counting against MaxBufferedMessages, otherwise the reserve
+	// of the cleared data is never returned and later messages are dropped for no reason.
+	[TestMethod]
+	public void ProcessInMessage_Reset_FreesBoardStateRoom()
+	{
+		var buffer = new StorageBuffer { MaxBufferedMessages = 1 };
+		var secId = CreateSecurityId();
+
+		buffer.ProcessOutMessage(CreateBoardState("TQBR", SessionStates.Active, DateTime.UtcNow));
+
+		buffer.ProcessInMessage(new ResetMessage());
+
+		buffer.ProcessOutMessage(CreateTick(secId, DateTime.UtcNow, 100, 10));
+
+		buffer.DroppedMessages.AssertEqual(0L, "nothing waits to be written after reset, so there is room");
+		buffer.GetTicks().Count.AssertEqual(1);
 	}
 
 	#endregion
@@ -945,6 +990,26 @@ public class StorageBufferTests : BaseTestClass
 
 		var transactions = buffer.GetTransactions();
 		transactions.Count.AssertEqual(1);
+	}
+
+	// An order sent in is a transaction as much as its execution coming back, so turning
+	// transactions off must keep it out of the buffer without FilterSubscription being involved.
+	[TestMethod]
+	public void ProcessInMessage_OrderRegister_NotBufferedWhenTransactionsDisabled()
+	{
+		var buffer = new StorageBuffer { EnabledTransactions = false };
+		var secId = CreateSecurityId();
+
+		buffer.ProcessInMessage(new OrderRegisterMessage
+		{
+			SecurityId = secId,
+			TransactionId = 123,
+			Side = Sides.Buy,
+			Price = 100,
+			Volume = 10,
+		});
+
+		buffer.GetTransactions().Count.AssertEqual(0, "transactions are turned off, so the order is not kept");
 	}
 
 	#endregion

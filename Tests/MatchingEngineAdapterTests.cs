@@ -102,7 +102,10 @@ public class MatchingEngineAdapterTests : BaseTestClass
 		};
 
 	private static decimal PositionOf(MatchingEngineAdapter engine, string account)
-		=> engine.PortfolioManager.GetPortfolio(account).GetPosition(_securityId)?.CurrentValue ?? 0m;
+		=> PositionOf(engine, account, _securityId);
+
+	private static decimal PositionOf(MatchingEngineAdapter engine, string account, SecurityId securityId)
+		=> engine.PortfolioManager.GetPortfolio(account).GetPosition(securityId)?.CurrentValue ?? 0m;
 
 	/// <summary>
 	/// Sends one market order of <paramref name="side"/> into a book holding a single level per side
@@ -123,6 +126,26 @@ public class MatchingEngineAdapterTests : BaseTestClass
 		return run.Executions
 			.Where(m => m.HasTradeInfo() && m.OriginalTransactionId == tx)
 			.Sum(m => m.TradeVolume ?? 0m);
+	}
+
+	/// <summary>
+	/// A condition that is a take-profit and nothing else - the shape a venue offering only
+	/// take-profits sends, and the shape the engine has to recognise as a stop rather than as a
+	/// priceless ordinary order.
+	/// </summary>
+	private sealed class TakeProfitOnlyCondition : OrderCondition, ITakeProfitOrderCondition
+	{
+		public decimal? ActivationPrice
+		{
+			get => (decimal?)Parameters.TryGetValue(nameof(ActivationPrice));
+			set => Parameters[nameof(ActivationPrice)] = value;
+		}
+
+		public decimal? ClosePositionPrice
+		{
+			get => (decimal?)Parameters.TryGetValue(nameof(ClosePositionPrice));
+			set => Parameters[nameof(ClosePositionPrice)] = value;
+		}
 	}
 
 	#endregion
@@ -880,6 +903,218 @@ public class MatchingEngineAdapterTests : BaseTestClass
 	}
 
 	/// <summary>
+	/// A close nobody can price is a close that did not happen, and the caller has to be told: answered
+	/// by silence it reads the request as carried out and its risk as flat, while the position stands.
+	/// </summary>
+	[TestMethod]
+	public async Task AGroupCancelThatCannotCloseAPositionSaysSoInsteadOfPassingSilently()
+	{
+		const string account = "Client";
+		const long groupTx = 6301;
+
+		var engine = new MatchingEngineAdapter();
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(PositionRow(_securityId, account, 5m, 90m, _start), CancellationToken);
+
+		// Offers only: nothing is bid for the instrument, so a long of 5 has nothing to be sold into.
+		await run.SendAsync(VenueBook(_securityId, _start, [], [new QuoteChange(101m, 10m)]), CancellationToken);
+
+		await run.SendAsync(new OrderGroupCancelMessage
+		{
+			TransactionId = groupTx,
+			PortfolioName = account,
+			Mode = OrderGroupCancelModes.ClosePositions,
+			LocalTime = _start.AddSeconds(1),
+		}, CancellationToken);
+
+		AreEqual(0, run.Executions.Count(m => m.HasTradeInfo()), "an empty bid side can fill nothing");
+		AreEqual(5m, PositionOf(engine, account), "so the account still holds the 5 it was long");
+
+		IsTrue(run.Executions.Any(m => m.OriginalTransactionId == groupTx && m.OrderState == OrderStates.Failed && m.Error is not null),
+			"the request was not carried out, and this engine already answers a ClosePositions it cannot carry out with a failure on the request's own id");
+	}
+
+	/// <summary>
+	/// A close takes what the market holds and no more: against a bid of 3 a long of 10 closes 3 and
+	/// keeps 7. What could not be closed has to stay a working order for exactly those 7, or the caller
+	/// is left with an open position and nothing standing to close it.
+	/// </summary>
+	[TestMethod]
+	public async Task AGroupCancelClosesOnlyWhatTheBookCanTakeAndKeepsTheRestWorking()
+	{
+		const string account = "Client";
+		const long groupTx = 6401;
+
+		var engine = new MatchingEngineAdapter();
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(PositionRow(_securityId, account, 10m, 90m, _start), CancellationToken);
+
+		// 3 lots are bid at 100, so 3 of the 10 can be sold there and 10 - 3 = 7 cannot.
+		await run.SendAsync(VenueBook(_securityId, _start, [new QuoteChange(100m, 3m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+
+		await run.SendAsync(new OrderGroupCancelMessage
+		{
+			TransactionId = groupTx,
+			PortfolioName = account,
+			Mode = OrderGroupCancelModes.ClosePositions,
+			LocalTime = _start.AddSeconds(1),
+		}, CancellationToken);
+
+		var fills = run.Executions.Where(m => m.HasTradeInfo()).ToArray();
+
+		AreEqual(1, fills.Length, "one level was bid, so one fill comes of taking it");
+		AreEqual(3m, fills[0].TradeVolume, "the bid held 3 lots, and 3 is all a close can take from it");
+		AreEqual(7m, PositionOf(engine, account), "10 held less the 3 closed leaves 7 open");
+
+		var closeTx = fills[0].OriginalTransactionId;
+		var lastRow = run.Executions.LastOrDefault(m => m.OriginalTransactionId == closeTx && m.HasOrderInfo && !m.HasTradeInfo());
+
+		IsNotNull(lastRow, "the caller has to be told where the closing order stands");
+		AreEqual(OrderStates.Active, lastRow.OrderState, "the part the market could not take is still working, not finished");
+		AreEqual(7m, lastRow.Balance, "and it works for exactly the 7 that stayed open");
+
+		IsTrue(engine.GetSecurityState(_securityId).OrderBook.HasLevel(Sides.Sell, 100m),
+			"an order reported as working has to stand in the book it works in");
+	}
+
+	/// <summary>
+	/// A close reaches only the account the request names. Another account's position is not the
+	/// caller's to flatten, and closing it trades on its behalf without its asking.
+	/// </summary>
+	[TestMethod]
+	public async Task AGroupCancelClosesOnlyTheAccountItNames()
+	{
+		const string named = "Client";
+		const string other = "Other";
+		const long groupTx = 6501;
+
+		var engine = new MatchingEngineAdapter();
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(PositionRow(_securityId, named, 5m, 90m, _start), CancellationToken);
+		await run.SendAsync(PositionRow(_securityId, other, 4m, 95m, _start), CancellationToken);
+
+		// 20 lots are bid, more than both positions together, so liquidity decides nothing here.
+		await run.SendAsync(VenueBook(_securityId, _start, [new QuoteChange(100m, 20m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+
+		await run.SendAsync(new OrderGroupCancelMessage
+		{
+			TransactionId = groupTx,
+			PortfolioName = named,
+			Mode = OrderGroupCancelModes.ClosePositions,
+			LocalTime = _start.AddSeconds(1),
+		}, CancellationToken);
+
+		var fills = run.Executions.Where(m => m.HasTradeInfo()).ToArray();
+
+		AreEqual(1, fills.Length, "one account was named, so one position is closed");
+		AreEqual(named, fills[0].PortfolioName, "and the fill belongs to the account that was named");
+		AreEqual(5m, fills[0].TradeVolume, "which was long 5");
+
+		AreEqual(0m, PositionOf(engine, named), "the named account ends the request flat");
+		AreEqual(4m, PositionOf(engine, other), "the account nobody asked about keeps the 4 it held");
+	}
+
+	/// <summary>
+	/// Side narrows what a close touches. With it set on an account holding one long and one short,
+	/// exactly one is closed and the other is left as it was - ignoring the filter flattens both,
+	/// misreading it flattens neither.
+	/// </summary>
+	[TestMethod]
+	public async Task SideNarrowsWhichPositionsAGroupCancelCloses()
+	{
+		const string account = "Client";
+		const long groupTx = 6601;
+
+		var engine = new MatchingEngineAdapter();
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(PositionRow(_securityId, account, 5m, 90m, _start), CancellationToken);
+		await run.SendAsync(PositionRow(_otherSecurityId, account, -4m, 40m, _start), CancellationToken);
+
+		await run.SendAsync(VenueBook(_securityId, _start, [new QuoteChange(100m, 10m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+		await run.SendAsync(VenueBook(_otherSecurityId, _start, [new QuoteChange(50m, 10m)], [new QuoteChange(51m, 10m)]), CancellationToken);
+
+		await run.SendAsync(new OrderGroupCancelMessage
+		{
+			TransactionId = groupTx,
+			PortfolioName = account,
+			Side = Sides.Buy,
+			Mode = OrderGroupCancelModes.ClosePositions,
+			LocalTime = _start.AddSeconds(1),
+		}, CancellationToken);
+
+		var fills = run.Executions.Where(m => m.HasTradeInfo()).ToArray();
+		var longAfter = PositionOf(engine, account, _securityId);
+		var shortAfter = PositionOf(engine, account, _otherSecurityId);
+
+		AreEqual(1, fills.Length, $"a side picks one of the two positions, not both and not neither; long {longAfter}, short {shortAfter}");
+
+		var longClosed = longAfter == 0m;
+		var shortClosed = shortAfter == 0m;
+
+		IsTrue(longClosed != shortClosed, $"exactly one of the two must be closed; long {longAfter}, short {shortAfter}");
+
+		if (longClosed)
+			AreEqual(-4m, shortAfter, "the position the side passed over must be left exactly as it was");
+		else
+			AreEqual(5m, longAfter, "the position the side passed over must be left exactly as it was");
+	}
+
+	/// <summary>
+	/// One request that both cancels orders and closes positions has to cancel first. The account's own
+	/// bid of 100 stands above the venue's 99, so a close priced before the cancel meets that bid: the
+	/// sell and the buy are both the account's, they net to nothing, and it ends the request still long.
+	/// </summary>
+	[TestMethod]
+	public async Task AGroupCancelCancelsTheAccountsOrdersBeforeClosingItsPositions()
+	{
+		const string account = "Client";
+		const long restingTx = 6701;
+		const long groupTx = 6702;
+
+		var engine = new MatchingEngineAdapter();
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(PositionRow(_securityId, account, 5m, 90m, _start), CancellationToken);
+		await run.SendAsync(VenueBook(_securityId, _start, [new QuoteChange(99m, 10m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+
+		// A buy of 5 at 100 rests: 100 is under the ask of 101, and it becomes the best bid.
+		await run.SendAsync(NewOrder(restingTx, account, Sides.Buy, OrderTypes.Limit, 100m, 5m, _start.AddSeconds(1)), CancellationToken);
+
+		IsTrue(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(restingTx, out _),
+			"the order has to be working before the request can reach it");
+
+		await run.SendAsync(new OrderGroupCancelMessage
+		{
+			TransactionId = groupTx,
+			PortfolioName = account,
+			Mode = OrderGroupCancelModes.CancelOrders | OrderGroupCancelModes.ClosePositions,
+			LocalTime = _start.AddSeconds(2),
+		}, CancellationToken);
+
+		var cancelRow = run.Executions.LastOrDefault(m => m.OriginalTransactionId == restingTx && m.HasOrderInfo && !m.HasTradeInfo());
+
+		IsNotNull(cancelRow, "a request that says CancelOrders has to answer for the order it ended");
+		AreEqual(OrderStates.Done, cancelRow.OrderState, "the working order is finished by the cancel");
+		IsFalse(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(restingTx, out _),
+			"and it no longer stands to be filled");
+
+		var fills = run.Executions.Where(m => m.HasTradeInfo()).ToArray();
+
+		AreEqual(1, fills.Length, "one fill closes the long, and a second one would mean it traded with itself");
+		AreEqual(5m, fills[0].TradeVolume, "the whole position is closed");
+		AreEqual(99m, fills[0].TradePrice, "the account's own bid of 100 was cancelled first, so the close meets the venue's 99");
+
+		IsFalse(fills.Any(m => m.OriginalTransactionId == restingTx),
+			"the close must not be filled by the order the same request cancelled");
+
+		AreEqual(0m, PositionOf(engine, account), "the account ends the request flat");
+	}
+
+	/// <summary>
 	/// A market buy must reach as far into the book as the mirrored market sell does; the same order
 	/// on the other side cannot fill a hundredth of it.
 	/// </summary>
@@ -937,8 +1172,8 @@ public class MatchingEngineAdapterTests : BaseTestClass
 		AreEqual(OrderStates.Done, state.OrderState);
 		AreEqual(99m, state.Balance, "one lot was offered, so ninety-nine of the hundred found no liquidity");
 
-		// Registration blocked all hundred lots at the best bid of 100. What stays blocked afterwards
-		// is the one lot actually bought, at the price it was bought at.
+		// Registration held all hundred lots at the ask of 101 the order was checked against. What stays
+		// blocked afterwards is the one lot actually bought, at the price it was bought at.
 		AreEqual(101m, engine.PortfolioManager.GetPortfolio(account).BlockedMoney);
 	}
 
@@ -985,5 +1220,878 @@ public class MatchingEngineAdapterTests : BaseTestClass
 
 		AreEqual(volume, order.Balance, "for everything it was placed for");
 		AreEqual(0m, PositionOf(engine, account), "the account took on no position from someone else's trade");
+	}
+
+	/// <summary>
+	/// A replace is a cancel and a registration, and the registration can be refused. Whichever of the
+	/// two orders the engine keeps, the caller has to be told the new one failed and has to be told
+	/// what became of the old one - and cancelling both has to leave the account blocking nothing,
+	/// because money held against an order no cancel can reach is money it never gets back.
+	/// </summary>
+	[TestMethod]
+	public async Task AReplaceWhoseNewOrderIsRefusedLeavesTheAccountBlockingNothing()
+	{
+		const string account = "Trader";
+		const decimal begin = 1000m;
+		const long oldTx = 6001;
+		const long newTx = 6002;
+
+		var engine = new MatchingEngineAdapter();
+		engine.Settings.CheckMoney = true;
+
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(MoneyRow(account, begin, _start), CancellationToken);
+		await run.SendAsync(VenueBook(_securityId, _start,
+			[new QuoteChange(100m, 10m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+
+		// A buy of 2 at 50 costs 100 of the 1000 the account holds, and rests: 50 is under the ask.
+		await run.SendAsync(NewOrder(oldTx, account, Sides.Buy, OrderTypes.Limit, 50m, 2m, _start.AddSeconds(1)), CancellationToken);
+
+		IsTrue(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(oldTx, out _),
+			"the order to be replaced has to be resting first");
+		IsTrue(engine.PortfolioManager.GetPortfolio(account).BlockedMoney > 0m,
+			"and holding money against it, or there is nothing for the replace to release");
+
+		// Replacing it with 100 at 60 asks the account for 6000 where it was funded with 1000.
+		await run.SendAsync(new OrderReplaceMessage
+		{
+			TransactionId = newTx,
+			OriginalTransactionId = oldTx,
+			SecurityId = _securityId,
+			PortfolioName = account,
+			Side = Sides.Buy,
+			OrderType = OrderTypes.Limit,
+			Price = 60m,
+			Volume = 100m,
+			LocalTime = _start.AddSeconds(2),
+		}, CancellationToken);
+
+		var newRows = run.Executions.Where(m => m.HasOrderInfo() && m.OriginalTransactionId == newTx).ToArray();
+
+		IsTrue(newRows.Any(m => m.OrderState == OrderStates.Failed && m.Error is not null),
+			$"the replacement is unpayable, so the caller must be told it failed and why; states were {newRows.Select(m => m.OrderState.ToString()).JoinComma()}");
+
+		IsTrue(run.Executions.Any(m => m.HasOrderInfo() && m.OriginalTransactionId == oldTx),
+			"and told what became of the order it asked to replace, or it cannot know which of the two is live");
+
+		// Cancelling both transactions the caller named: one of them is not live and answers so, which
+		// is not an error of the account's. Nothing traded and no position was taken, so what the
+		// account blocks afterwards is 0 and what it can trade with is the 1000 it was funded with.
+		await run.SendAsync(new OrderCancelMessage
+		{
+			TransactionId = 6003,
+			OriginalTransactionId = oldTx,
+			SecurityId = _securityId,
+			PortfolioName = account,
+			LocalTime = _start.AddSeconds(3),
+		}, CancellationToken);
+
+		await run.SendAsync(new OrderCancelMessage
+		{
+			TransactionId = 6004,
+			OriginalTransactionId = newTx,
+			SecurityId = _securityId,
+			PortfolioName = account,
+			LocalTime = _start.AddSeconds(4),
+		}, CancellationToken);
+
+		var portfolio = engine.PortfolioManager.GetPortfolio(account);
+
+		AreEqual(0m, PositionOf(engine, account), "a refused replace trades nothing");
+		AreEqual(0m, portfolio.BlockedMoney,
+			"no order of this account is live any more, so none of its money may stay blocked");
+		AreEqual(begin, portfolio.AvailableMoney,
+			"and everything it was funded with is available to trade with again");
+	}
+
+	/// <summary>
+	/// An order that reaches its expiry is taken off the book and reported Done, and the money it was
+	/// holding is the account's again: nothing is live to hold it. Anything less and every expiry
+	/// quietly costs the account buying power it can never get back, since no cancel can reach an
+	/// order that is already gone.
+	/// </summary>
+	[TestMethod]
+	public async Task AnExpiredOrderGivesTheAccountItsMoneyBack()
+	{
+		const string account = "Trader";
+		const decimal begin = 1000m;
+		const long restingTx = 7001;
+		const long refusedTx = 7002;
+		const long afterExpiryTx = 7003;
+
+		var engine = new MatchingEngineAdapter();
+		engine.Settings.CheckMoney = true;
+
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(MoneyRow(account, begin, _start), CancellationToken);
+		await run.SendAsync(VenueBook(_securityId, _start,
+			[new QuoteChange(100m, 10m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+
+		// A buy of 5 at 90 rests: 90 is under the ask, and nothing in the book crosses it. It can never
+		// cost more than the 90 it names, which is the price it was checked against, so 5 * 90 = 450
+		// of the 1000 is held against it.
+		var resting = NewOrder(restingTx, account, Sides.Buy, OrderTypes.Limit, 90m, 5m, _start.AddSeconds(1));
+		resting.TillDate = _start.AddSeconds(10);
+		await run.SendAsync(resting, CancellationToken);
+
+		var portfolio = engine.PortfolioManager.GetPortfolio(account);
+
+		IsTrue(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(restingTx, out _),
+			"the order has to be resting before it can expire");
+		AreEqual(450m, portfolio.BlockedMoney, "5 lots held at the 90 they were checked against");
+		AreEqual(550m, portfolio.AvailableMoney, "leaving the rest of the 1000 to trade with");
+
+		// A second buy of 9 at 90 costs 810, more than the 550 still free, so it cannot be paid for
+		// while the first order is alive.
+		await run.SendAsync(NewOrder(refusedTx, account, Sides.Buy, OrderTypes.Limit, 90m, 9m, _start.AddSeconds(2)), CancellationToken);
+
+		IsTrue(run.Executions.Any(m => m.OriginalTransactionId == refusedTx && m.OrderState == OrderStates.Failed && m.Error is not null),
+			"810 is beyond the 550 the account has free while the first order holds the rest");
+
+		await run.SendAsync(new TimeMessage
+		{
+			LocalTime = _start.AddSeconds(30),
+			ServerTime = _start.AddSeconds(30),
+		}, CancellationToken);
+
+		var expiryRow = run.Executions.LastOrDefault(m => m.OriginalTransactionId == restingTx && m.HasOrderInfo && !m.HasTradeInfo());
+
+		IsNotNull(expiryRow, "the caller has to be told the order ended");
+		AreEqual(OrderStates.Done, expiryRow.OrderState, "an expired order is finished, not still working");
+		AreEqual(5m, expiryRow.Balance, "and nothing of it was ever filled");
+
+		IsFalse(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(restingTx, out _),
+			"an expired order is no longer live");
+		IsFalse(engine.GetSecurityState(_securityId).OrderBook.HasLevel(Sides.Buy, 90m),
+			"and no longer stands in the book to be filled");
+
+		AreEqual(0m, portfolio.BlockedMoney,
+			"no order of this account is live any more, so none of its money may stay blocked");
+		AreEqual(begin, portfolio.AvailableMoney,
+			"and everything it was funded with is available to trade with again");
+
+		// The same 810 the account could not pay for while the order was alive.
+		await run.SendAsync(NewOrder(afterExpiryTx, account, Sides.Buy, OrderTypes.Limit, 90m, 9m, _start.AddSeconds(31)), CancellationToken);
+
+		var afterExpiryRows = run.Executions.Where(m => m.OriginalTransactionId == afterExpiryTx && m.HasOrderInfo && !m.HasTradeInfo()).ToArray();
+
+		IsFalse(afterExpiryRows.Any(m => m.OrderState == OrderStates.Failed),
+			$"the money the expiry released has to be spendable; states were {afterExpiryRows.Select(m => m.OrderState.ToString()).JoinComma()}");
+		IsTrue(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(afterExpiryTx, out _),
+			"and the order it paid for has to be working");
+	}
+
+	/// <summary>
+	/// When an order is partly filled before it expires, the account owes back the margin of the
+	/// balance that never traded and nothing else: the filled lots were paid for and are a position
+	/// now, so what the expiry releases is the remainder alone.
+	/// </summary>
+	[TestMethod]
+	public async Task AnExpiredPartialFillGivesBackOnlyWhatItsRemainderHeld()
+	{
+		const string account = "Trader";
+		const decimal begin = 10000m;
+		const long tx = 8001;
+		const long refusedTx = 8002;
+		const long afterExpiryTx = 8003;
+
+		var engine = new MatchingEngineAdapter();
+		engine.Settings.CheckMoney = true;
+
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(MoneyRow(account, begin, _start), CancellationToken);
+		await run.SendAsync(VenueBook(_securityId, _start,
+			[new QuoteChange(100m, 10m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+
+		// A buy of 15 at 101 takes the 10 lots offered and rests for the other 5. Registration held all
+		// 15 at the 101 they were checked against (1515); the 10 that traded release their share of
+		// that at the same average, so 5 * 101 = 505 stays held against the balance.
+		var order = NewOrder(tx, account, Sides.Buy, OrderTypes.Limit, 101m, 15m, _start.AddSeconds(1));
+		order.TillDate = _start.AddSeconds(10);
+		await run.SendAsync(order, CancellationToken);
+
+		var portfolio = engine.PortfolioManager.GetPortfolio(account);
+		var position = portfolio.GetPosition(_securityId);
+
+		AreEqual(10m, PositionOf(engine, account), "the book offered 10 of the 15");
+		IsTrue(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(tx, out var resting),
+			"and the balance rests, waiting for a counterparty");
+		AreEqual(5m, resting.Balance, "which is the other 5");
+		AreEqual(505m, position.TotalBidsValue, "5 lots still held at the 101 they were checked against");
+
+		var blockedBefore = portfolio.BlockedMoney;
+
+		// 86 lots at 100 cost 8600, beyond what the account has free while the balance is alive.
+		await run.SendAsync(NewOrder(refusedTx, account, Sides.Buy, OrderTypes.Limit, 100m, 86m, _start.AddSeconds(2)), CancellationToken);
+
+		IsTrue(run.Executions.Any(m => m.OriginalTransactionId == refusedTx && m.OrderState == OrderStates.Failed && m.Error is not null),
+			$"8600 is beyond the {portfolio.AvailableMoney} the account has free while the balance holds 500");
+
+		await run.SendAsync(new TimeMessage
+		{
+			LocalTime = _start.AddSeconds(30),
+			ServerTime = _start.AddSeconds(30),
+		}, CancellationToken);
+
+		var expiryRow = run.Executions.LastOrDefault(m => m.OriginalTransactionId == tx && m.HasOrderInfo && !m.HasTradeInfo());
+
+		IsNotNull(expiryRow, "the caller has to be told the order ended");
+		AreEqual(OrderStates.Done, expiryRow.OrderState, "an expired order is finished, not still working");
+		AreEqual(5m, expiryRow.Balance, "with the 5 that never found a counterparty");
+
+		IsFalse(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(tx, out _),
+			"an expired order is no longer live");
+		IsFalse(engine.GetSecurityState(_securityId).OrderBook.HasLevel(Sides.Buy, 101m),
+			"and no longer stands in the book to be filled");
+
+		AreEqual(10m, PositionOf(engine, account), "expiry ends the balance, it does not undo the fill");
+		AreEqual(0m, position.TotalBidsVolume, "no buy order of this account is live any more");
+		AreEqual(0m, position.TotalBidsValue, "so nothing may stay held against one");
+		AreEqual(blockedBefore - 505m, portfolio.BlockedMoney,
+			"the expiry owes back the 5 unfilled lots at the 101 they were held at, and no more: the 10 that traded were paid for");
+
+		// The same 8600 the account could not pay for while the balance was alive.
+		await run.SendAsync(NewOrder(afterExpiryTx, account, Sides.Buy, OrderTypes.Limit, 100m, 86m, _start.AddSeconds(31)), CancellationToken);
+
+		var afterExpiryRows = run.Executions.Where(m => m.OriginalTransactionId == afterExpiryTx && m.HasOrderInfo && !m.HasTradeInfo()).ToArray();
+
+		IsFalse(afterExpiryRows.Any(m => m.OrderState == OrderStates.Failed),
+			$"the money the expiry released has to be spendable; states were {afterExpiryRows.Select(m => m.OrderState.ToString()).JoinComma()}");
+	}
+
+	/// <summary>
+	/// A take-profit rests until its price is reached, like any other stop. Not recognising the
+	/// condition sends it to the book as an ordinary order carrying no price, and a sell at no price
+	/// takes every bid there is - the account is flattened at the market the moment it asks to be
+	/// taken out higher.
+	/// </summary>
+	[TestMethod]
+	public async Task ATakeProfitDoesNotSellIntoTheBookBeforeItsPriceIsReached()
+	{
+		const string account = "Client";
+		const long takeTx = 9101;
+
+		var engine = new MatchingEngineAdapter();
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(VenueBook(_securityId, _start,
+			[new QuoteChange(100m, 10m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+
+		// Take me out at 110, said an account whose market is at 100.
+		var take = NewOrder(takeTx, account, Sides.Sell, OrderTypes.Conditional, 0m, 10m, _start.AddSeconds(1));
+		take.Condition = new TakeProfitOnlyCondition { ActivationPrice = 110m };
+
+		await run.SendAsync(take, CancellationToken);
+
+		var fills = run.Executions.Where(m => m.HasTradeInfo() && m.OriginalTransactionId == takeTx).ToArray();
+
+		AreEqual(0, fills.Length,
+			$"the market is at 100 and the take asks for 110, so nothing may trade yet; {fills.Sum(m => m.TradeVolume ?? 0m)} did");
+		AreEqual(0m, PositionOf(engine, account), "and the account may not be put short by an order that was never triggered");
+
+		var restsAsStop = engine.StopOrderManager.GetStopIds(_securityId).Contains(takeTx);
+		var refused = run.Executions.Any(m => m.HasOrderInfo() && m.OriginalTransactionId == takeTx && m.OrderState == OrderStates.Failed);
+
+		IsTrue(restsAsStop || refused,
+			"a take-profit is either taken as a stop and waits for its price, or refused outright - it may not be quietly accepted as something else");
+	}
+
+	/// <summary>
+	/// The engine numbers every order it accepts, and a status request naming that number must find
+	/// that order. The number the venue issued and the transaction the caller issued come from two
+	/// different generators, so reading one as the other finds nothing.
+	/// </summary>
+	[TestMethod]
+	public async Task AStatusRequestFindsTheOrderByTheNumberTheVenueGaveIt()
+	{
+		const string account = "Client";
+		const long orderTx = 9201;
+		const long statusTx = 9202;
+
+		var engine = new MatchingEngineAdapter();
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(VenueBook(_securityId, _start,
+			[new QuoteChange(100m, 10m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+
+		// A buy at 50 is under the ask, so it rests and can be asked about.
+		await run.SendAsync(NewOrder(orderTx, account, Sides.Buy, OrderTypes.Limit, 50m, 2m, _start.AddSeconds(1)), CancellationToken);
+
+		IsTrue(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(orderTx, out var resting),
+			"the order has to be resting before its status can be asked for");
+
+		var venueOrderId = resting.OrderId;
+
+		IsNotNull(venueOrderId, "the venue numbers what it accepts, or there is no number to ask by");
+		AreNotEqual(orderTx, venueOrderId.Value, "and that number is its own, not the transaction the caller issued");
+
+		await run.SendAsync(new OrderStatusMessage
+		{
+			TransactionId = statusTx,
+			OrderId = venueOrderId,
+			IsSubscribe = true,
+			LocalTime = _start.AddSeconds(2),
+		}, CancellationToken);
+
+		var rows = run.Executions.Where(m => m.HasOrderInfo() && m.OriginalTransactionId == statusTx).ToArray();
+
+		AreEqual(1, rows.Length, "the order asked for by the venue's own number must be the one answered");
+		AreEqual<long?>(venueOrderId, rows[0].OrderId, "and answered under that number");
+		AreEqual(orderTx, rows[0].TransactionId, "naming the transaction it was placed under, so the caller can match it to its own order");
+	}
+
+	/// <summary>
+	/// A replace naming an order the engine holds nothing for is refused, and refused once. Answering
+	/// it with a finished row for the unknown original tells the caller an order it still believes is
+	/// live has filled in full - it books a position that never traded and stops waiting for the order.
+	/// </summary>
+	[TestMethod]
+	public async Task AReplaceOfAnOrderTheEngineNeverHeldDoesNotReportItFilled()
+	{
+		const string account = "Client";
+		const long unknownTx = 9301;
+		const long newTx = 9302;
+
+		var engine = new MatchingEngineAdapter();
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(VenueBook(_securityId, _start,
+			[new QuoteChange(100m, 10m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+
+		await run.SendAsync(new OrderReplaceMessage
+		{
+			TransactionId = newTx,
+			OriginalTransactionId = unknownTx,
+			SecurityId = _securityId,
+			PortfolioName = account,
+			Side = Sides.Buy,
+			OrderType = OrderTypes.Limit,
+			Price = 50m,
+			Volume = 1m,
+			LocalTime = _start.AddSeconds(1),
+		}, CancellationToken);
+
+		IsTrue(run.Executions.Any(m => m.HasOrderInfo() && m.OriginalTransactionId == newTx && m.OrderState == OrderStates.Failed && m.Error is not null),
+			"there was nothing to replace, so the replacement must be refused and the reason stated");
+
+		var originalRows = run.Executions.Where(m => m.HasOrderInfo() && m.OriginalTransactionId == unknownTx).ToArray();
+
+		IsFalse(originalRows.Any(m => m.OrderState == OrderStates.Done && m.Balance == 0m),
+			$"an order the engine never held may not be reported finished with nothing left of it; rows were {originalRows.Select(m => $"{m.OrderState}/{m.Balance}").JoinComma()}");
+	}
+
+	/// <summary>
+	/// An order is held against the account at the price it was checked against, and a side of the book
+	/// standing empty changes nothing about that: a buy at 100 for 10 lots commits 1000 whether or not
+	/// anyone is bidding. Holding nothing lets the very same money be checked again and spent twice, so
+	/// the second order here has to be refused.
+	/// </summary>
+	[TestMethod]
+	public async Task AnOrderOnAnEmptyBookSideStillCostsTheAccountWhatItCommits()
+	{
+		const string account = "Trader";
+		const decimal begin = 1000m;
+		const long firstTx = 9101;
+		const long secondTx = 9102;
+
+		var engine = new MatchingEngineAdapter();
+		engine.Settings.CheckMoney = true;
+
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(MoneyRow(account, begin, _start), CancellationToken);
+
+		// Offers only: nobody is bidding, so the buy side of the book is empty.
+		await run.SendAsync(VenueBook(_securityId, _start, [], [new QuoteChange(101m, 10m)]), CancellationToken);
+
+		// 10 lots at 100 cost 1000 - the whole account - and rest, since 100 is under the ask of 101.
+		await run.SendAsync(NewOrder(firstTx, account, Sides.Buy, OrderTypes.Limit, 100m, 10m, _start.AddSeconds(1)), CancellationToken);
+
+		var portfolio = engine.PortfolioManager.GetPortfolio(account);
+
+		IsTrue(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(firstTx, out _),
+			"the account can afford the first order, so it has to be resting");
+
+		var blockedAfterFirst = portfolio.BlockedMoney;
+
+		// The same order again, for the same money the account no longer has.
+		await run.SendAsync(NewOrder(secondTx, account, Sides.Buy, OrderTypes.Limit, 100m, 10m, _start.AddSeconds(2)), CancellationToken);
+
+		var secondRows = run.Executions.Where(m => m.HasOrderInfo() && m.OriginalTransactionId == secondTx).ToArray();
+
+		IsTrue(secondRows.Any(m => m.OrderState == OrderStates.Failed && m.Error is not null),
+			$"the first order already spoke for all 1000, so the second cannot be paid for; states were {secondRows.Select(m => m.OrderState.ToString()).JoinComma()}");
+
+		AreEqual(1000m, blockedAfterFirst,
+			"a resting buy of 10 at 100 commits 1000 of the account, whether or not the bid side of the book is empty");
+	}
+
+	/// <summary>
+	/// What an order holds is what it was checked against: a limit can never trade above its own price,
+	/// so that is the price the account is asked for and the price it stays held at. Holding it at the
+	/// best of its own side instead is a number the account was never checked against - too little when
+	/// the order is priced above the touch, and the difference is spendable twice.
+	/// </summary>
+	[TestMethod]
+	public async Task AnOrderIsHeldAtThePriceItWasCheckedAgainstNotAtTheBestOfItsOwnSide()
+	{
+		const string account = "Trader";
+		const decimal begin = 1000m;
+		const long restingTx = 9201;
+		const long refusedTx = 9202;
+
+		var engine = new MatchingEngineAdapter();
+		engine.Settings.CheckMoney = true;
+
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(MoneyRow(account, begin, _start), CancellationToken);
+		await run.SendAsync(VenueBook(_securityId, _start,
+			[new QuoteChange(100m, 10m)], [new QuoteChange(200m, 10m)]), CancellationToken);
+
+		// A buy of 5 at 110 stands above the bid of 100 and under the ask of 200, so it rests. It was
+		// checked against 5 * 110 = 550 of the 1000, and that is what it holds.
+		await run.SendAsync(NewOrder(restingTx, account, Sides.Buy, OrderTypes.Limit, 110m, 5m, _start.AddSeconds(1)), CancellationToken);
+
+		var portfolio = engine.PortfolioManager.GetPortfolio(account);
+
+		IsTrue(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(restingTx, out _),
+			"the order has to be resting for its money to be held");
+
+		var blockedAfterResting = portfolio.BlockedMoney;
+
+		// 4 lots at 120 cost 480, beyond the 450 the account still has free.
+		await run.SendAsync(NewOrder(refusedTx, account, Sides.Buy, OrderTypes.Limit, 120m, 4m, _start.AddSeconds(2)), CancellationToken);
+
+		var refusedRows = run.Executions.Where(m => m.HasOrderInfo() && m.OriginalTransactionId == refusedTx).ToArray();
+
+		IsTrue(refusedRows.Any(m => m.OrderState == OrderStates.Failed && m.Error is not null),
+			$"480 is beyond the 450 left free by an order holding 550; states were {refusedRows.Select(m => m.OrderState.ToString()).JoinComma()}");
+
+		AreEqual(550m, blockedAfterResting,
+			"5 lots at the 110 the order named and was checked against, not at the 100 someone else is bidding");
+	}
+
+	/// <summary>
+	/// Both sides of a fill are trades, and both book a position, so both are priced through the same
+	/// seam. What the tariff charges either side is the caller's business - the seam is handed the row
+	/// and can read its side from it - but the engine has to ask about the maker's fill too, or half
+	/// the trades of an internalised book are free whatever the tariff says.
+	/// </summary>
+	[TestMethod]
+	public async Task AMakerFillIsPricedTheSameWayTheTakerFillIs()
+	{
+		const string maker = "Maker";
+		const string taker = "Taker";
+		const long makerTx = 9301;
+		const long takerTx = 9302;
+		const decimal fee = 3m;
+
+		var engine = new MatchingEngineAdapter();
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(MoneyRow(maker, 100_000m, _start), CancellationToken);
+		await run.SendAsync(MoneyRow(taker, 100_000m, _start), CancellationToken);
+
+		// Offers far above and nobody else bidding: the maker's buy at 100 rests alone on its side.
+		await run.SendAsync(VenueBook(_securityId, _start, [], [new QuoteChange(200m, 10m)]), CancellationToken);
+		await run.SendAsync(NewOrder(makerTx, maker, Sides.Buy, OrderTypes.Limit, 100m, 10m, _start.AddSeconds(1)), CancellationToken);
+
+		IsTrue(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(makerTx, out _),
+			"the maker has to be resting for the taker to hit it");
+
+		var state = engine.GetSecurityState(_securityId);
+		var regMsg = NewOrder(takerTx, taker, Sides.Sell, OrderTypes.Limit, 100m, 4m, _start.AddSeconds(2));
+
+		var order = new EmulatorOrder
+		{
+			TransactionId = regMsg.TransactionId,
+			Side = regMsg.Side,
+			Price = regMsg.Price,
+			Balance = regMsg.Volume,
+			Volume = regMsg.Volume,
+			PortfolioName = regMsg.PortfolioName,
+			OrderType = regMsg.OrderType,
+			ServerTime = regMsg.LocalTime,
+			LocalTime = regMsg.LocalTime,
+			MarginPrice = regMsg.Price,
+			OrderId = 7701,
+		};
+
+		var matchResult = new OrderMatcher().Match(order, state.OrderBook, new MatchingSettings
+		{
+			PriceStep = state.PriceStep,
+			VolumeStep = state.VolumeStep,
+		});
+
+		var replyMsg = new ExecutionMessage
+		{
+			HasOrderInfo = true,
+			DataTypeEx = DataType.Transactions,
+			ServerTime = regMsg.LocalTime,
+			LocalTime = regMsg.LocalTime,
+			OriginalTransactionId = takerTx,
+			PortfolioName = taker,
+			Side = regMsg.Side,
+			OrderState = OrderStates.Active,
+		};
+
+		var results = new List<Message> { replyMsg };
+
+		// The tariff prices every row it is handed the same way; nothing about it singles out a side.
+		engine.EmitRegistrationResult(regMsg, order, matchResult, replyMsg, _ => fee, results);
+
+		var trades = results.OfType<ExecutionMessage>().Where(m => m.HasTradeInfo()).ToArray();
+
+		AreEqual(2, trades.Length,
+			$"one fill has two sides, the taker's and the maker's; got {trades.Select(m => m.OriginalTransactionId.ToString()).JoinComma()}");
+
+		var takerRow = trades.First(m => m.OriginalTransactionId == takerTx);
+		var makerRow = trades.First(m => m.OriginalTransactionId == makerTx);
+
+		AreEqual((decimal?)fee, takerRow.Commission, "the taker's fill is priced by the tariff");
+		AreEqual((decimal?)fee, makerRow.Commission, "and the maker's fill is a fill too, so the tariff is asked about it as well");
+		AreEqual(fee, engine.PortfolioManager.GetPortfolio(maker).Commission,
+			"and the maker's account is charged what its own row says it owes");
+	}
+
+	/// <summary>
+	/// A stop ends one of two ways - its owner takes it back, or the market reaches it and it fills -
+	/// and the row that reports the ending has to say which. Both endings are reported as the same
+	/// final state on the same transaction, so what tells them apart is the instrument the row names
+	/// and how much of the order is left: a cancelled stop never traded and is outstanding in full, a
+	/// triggered one has been bought and has nothing left. A cancel row that states neither cannot be
+	/// booked at all - the reader either records a fill that never happened or misses one that did.
+	/// </summary>
+	[TestMethod]
+	public async Task ACancelledStopIsReportedWithEnoughToTellItFromATriggeredOne()
+	{
+		const string account = "Client";
+		const long cancelledTx = 9401;
+		const long triggeredTx = 9402;
+		const decimal volume = 3m;
+
+		var engine = new MatchingEngineAdapter();
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(VenueBook(_securityId, _start,
+			[new QuoteChange(100m, 10m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+
+		// Two stops of the same size, both waiting for the market to reach 105.
+		var cancelled = NewOrder(cancelledTx, account, Sides.Buy, OrderTypes.Conditional, 0m, volume, _start.AddSeconds(1));
+		cancelled.Condition = new StopOrderCondition { ActivationPrice = 105m };
+		await run.SendAsync(cancelled, CancellationToken);
+
+		var triggered = NewOrder(triggeredTx, account, Sides.Buy, OrderTypes.Conditional, 0m, volume, _start.AddSeconds(1));
+		triggered.Condition = new StopOrderCondition { ActivationPrice = 105m };
+		await run.SendAsync(triggered, CancellationToken);
+
+		// One is taken back by its owner.
+		await run.SendAsync(new OrderCancelMessage
+		{
+			TransactionId = 9403,
+			OriginalTransactionId = cancelledTx,
+			SecurityId = _securityId,
+			PortfolioName = account,
+			LocalTime = _start.AddSeconds(2),
+		}, CancellationToken);
+
+		// The market then prints through 105, firing the other.
+		await run.SendAsync(new Level1ChangeMessage
+		{
+			SecurityId = _securityId,
+			LocalTime = _start.AddSeconds(3),
+			ServerTime = _start.AddSeconds(3),
+		}
+		.Add(Level1Fields.LastTradePrice, 106m), CancellationToken);
+
+		var cancelRow = run.Executions.LastOrDefault(m => m.HasOrderInfo() && !m.HasTradeInfo() && m.OriginalTransactionId == cancelledTx);
+		var triggeredRow = run.Executions.LastOrDefault(m => m.HasOrderInfo() && !m.HasTradeInfo() && m.OriginalTransactionId == triggeredTx);
+
+		IsNotNull(cancelRow, "the owner has to be told the stop it took back has ended");
+		IsNotNull(triggeredRow, "and told what became of the one the market reached");
+
+		AreEqual(OrderStates.Done, cancelRow.OrderState, "a cancelled stop is finished");
+		AreEqual(OrderStates.Done, triggeredRow.OrderState, "and so is one that fired and filled");
+
+		AreEqual(_securityId, cancelRow.SecurityId,
+			"a row naming no instrument cannot be booked against one, and the stop was placed on this one");
+		AreEqual((decimal?)volume, cancelRow.OrderVolume, "the cancelled stop was placed for three lots");
+		AreEqual((decimal?)volume, cancelRow.Balance, "and none of them traded, so all three are still outstanding");
+
+		AreEqual((decimal?)0m, triggeredRow.Balance, "the stop the market reached was filled in full, so nothing of it is left");
+		AreNotEqual(cancelRow.Balance, triggeredRow.Balance, "which is what tells the two endings apart");
+	}
+
+	/// <summary>
+	/// A replace asks for one order to become another, and the account is entitled to keep the first
+	/// when the second is refused. Taking the working order off the book before the replacement has
+	/// been accepted leaves the account with nothing where it asked for an order at a different price:
+	/// it is flat on an instrument it believes it has a bid in, and no message it sent can bring the
+	/// order back, because the cancel was never what it asked for.
+	/// </summary>
+	[TestMethod]
+	public async Task ARefusedReplaceLeavesTheOriginalOrderWorking()
+	{
+		const string account = "Trader";
+		const decimal begin = 1000m;
+		const long oldTx = 9501;
+		const long newTx = 9502;
+
+		var engine = new MatchingEngineAdapter();
+		engine.Settings.CheckMoney = true;
+
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(MoneyRow(account, begin, _start), CancellationToken);
+		await run.SendAsync(VenueBook(_securityId, _start,
+			[new QuoteChange(100m, 10m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+
+		// A buy of 2 at 50 rests: 50 is under the ask, so nothing in the book crosses it.
+		await run.SendAsync(NewOrder(oldTx, account, Sides.Buy, OrderTypes.Limit, 50m, 2m, _start.AddSeconds(1)), CancellationToken);
+
+		IsTrue(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(oldTx, out _),
+			"the order to be replaced has to be resting first");
+
+		var portfolio = engine.PortfolioManager.GetPortfolio(account);
+		var blockedBefore = portfolio.BlockedMoney;
+
+		IsTrue(blockedBefore > 0m, "and holding money against it, or there is nothing to watch here");
+
+		// Replacing it with 100 lots at 60 asks the account for 6000 where it was funded with 1000.
+		await run.SendAsync(new OrderReplaceMessage
+		{
+			TransactionId = newTx,
+			OriginalTransactionId = oldTx,
+			SecurityId = _securityId,
+			PortfolioName = account,
+			Side = Sides.Buy,
+			OrderType = OrderTypes.Limit,
+			Price = 60m,
+			Volume = 100m,
+			LocalTime = _start.AddSeconds(2),
+		}, CancellationToken);
+
+		var newRows = run.Executions.Where(m => m.HasOrderInfo() && m.OriginalTransactionId == newTx).ToArray();
+
+		IsTrue(newRows.Any(m => m.OrderState == OrderStates.Failed && m.Error is not null),
+			$"the replacement is unpayable, so it must be refused and the reason stated; states were {newRows.Select(m => m.OrderState.ToString()).JoinComma()}");
+
+		IsTrue(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(oldTx, out var original),
+			"the replacement was refused, so the order it was to replace has to be standing untouched");
+		AreEqual(2m, original.Balance, "for everything it was placed for");
+		IsTrue(engine.GetSecurityState(_securityId).OrderBook.HasLevel(Sides.Buy, 50m),
+			"an order reported as working has to stand in the book it works in");
+
+		var oldRows = run.Executions.Where(m => m.HasOrderInfo() && m.OriginalTransactionId == oldTx).ToArray();
+
+		IsFalse(oldRows.Any(m => m.OrderState == OrderStates.Done || m.OrderState == OrderStates.Failed),
+			$"an order that is still working may not be reported finished; states were {oldRows.Select(m => m.OrderState.ToString()).JoinComma()}");
+
+		AreEqual(blockedBefore, portfolio.BlockedMoney,
+			"and the money held against a live order stays held, or the same money can be spent twice");
+	}
+
+	/// <summary>
+	/// A session asks the venue what an account holds and waits for the answer. An account the venue
+	/// was never told a cash balance for is an account all the same - it can hold a position taken
+	/// here - so the lookup has to answer for it: accepted, the account named, what it holds stated,
+	/// and the subscription closed out. Answered with silence, the session waits for an answer that
+	/// never comes and never learns about the position it is carrying.
+	/// </summary>
+	[TestMethod]
+	public async Task APortfolioLookupAnswersEvenWithNoMoneyRow()
+	{
+		const string account = "NeverFunded";
+		const long orderTx = 9601;
+		const long lookupTx = 9602;
+
+		var engine = new MatchingEngineAdapter();
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(VenueBook(_securityId, _start,
+			[new QuoteChange(100m, 10m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+
+		// No money row for this account ever reaches the engine; it takes a position all the same.
+		await run.SendAsync(NewOrder(orderTx, account, Sides.Buy, OrderTypes.Limit, 101m, 4m, _start.AddSeconds(1)), CancellationToken);
+
+		AreEqual(4m, PositionOf(engine, account), "the buy has to fill, or there is nothing for the lookup to report");
+
+		var before = run.Out.Count;
+
+		await run.SendAsync(new PortfolioLookupMessage
+		{
+			TransactionId = lookupTx,
+			PortfolioName = account,
+			IsSubscribe = true,
+			LocalTime = _start.AddSeconds(2),
+		}, CancellationToken);
+
+		var answer = run.Out.Skip(before).ToArray();
+
+		var accepted = answer.OfType<SubscriptionResponseMessage>().FirstOrDefault(m => m.OriginalTransactionId == lookupTx);
+
+		IsNotNull(accepted, "the session has to be told its lookup was accepted");
+		IsNull(accepted.Error, "and accepted without an error: asking about an unfunded account is not a mistake");
+
+		var named = answer.OfType<PortfolioMessage>().FirstOrDefault(m => m.OriginalTransactionId == lookupTx);
+
+		IsNotNull(named, "an account the engine holds a position for has to be named by the lookup, funded or not");
+		AreEqual(account, named.PortfolioName, "under the name it was asked about");
+
+		var held = answer.OfType<PositionChangeMessage>().FirstOrDefault(m => m.PortfolioName == account && m.SecurityId == _securityId);
+
+		IsNotNull(held, "and what the account holds has to be stated");
+		AreEqual((decimal?)4m, (decimal?)held.Changes.TryGetValue(PositionChangeTypes.CurrentValue),
+			"as the four lots it actually holds");
+
+		IsTrue(answer.Any(m => m is SubscriptionOnlineMessage o && o.OriginalTransactionId == lookupTx),
+			"and the lookup has to be closed out, or the session keeps waiting for an answer it has already been given");
+	}
+
+	/// <summary>
+	/// Some of what the venue sends carries no clock at all - an instrument definition is a fact
+	/// about the instrument, not about the moment. A resting order lives until the time it was given,
+	/// and that time is reached by the clock moving forward, never by a message that has none: an
+	/// order retired on the strength of an untimed message is an order the trader believed was
+	/// working, taken off the book at a moment that never happened.
+	/// </summary>
+	[TestMethod]
+	public async Task AMessageCarryingNoClockDoesNotRetireARestingOrder()
+	{
+		const string account = "Trader";
+		const long restingTx = 9701;
+
+		var engine = new MatchingEngineAdapter();
+		var run = new EngineRun(engine);
+
+		await run.SendAsync(VenueBook(_securityId, _start,
+			[new QuoteChange(100m, 10m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+
+		var resting = NewOrder(restingTx, account, Sides.Buy, OrderTypes.Limit, 90m, 5m, _start.AddSeconds(1));
+		resting.TillDate = _start.AddSeconds(10);
+
+		await run.SendAsync(resting, CancellationToken);
+
+		IsTrue(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(restingTx, out _),
+			"the order has to be resting before anything can take it off the book");
+
+		// An instrument definition carries no LocalTime at all.
+		await run.SendAsync(new SecurityMessage { SecurityId = _securityId }, CancellationToken);
+
+		IsTrue(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(restingTx, out _),
+			"a message with no clock is not the passing of time, so the order is still working");
+
+		IsFalse(run.Executions.Any(m => m.OriginalTransactionId == restingTx && m.HasOrderInfo && m.OrderState == OrderStates.Done),
+			"and nothing may be reported ended while it is still live");
+
+		// Once the clock really does move past the order's own expiry, it ends as it was told to.
+		await run.SendAsync(new TimeMessage
+		{
+			LocalTime = _start.AddSeconds(30),
+			ServerTime = _start.AddSeconds(30),
+		}, CancellationToken);
+
+		IsFalse(engine.GetSecurityState(_securityId).OrderManager.TryGetOrder(restingTx, out _),
+			"the expiry the order was given still holds once time actually reaches it");
+	}
+
+	/// <summary>
+	/// A book deepened so a large order can fill is a convenience of replay, and it is still a book:
+	/// every level it gains has to be a price someone could really have traded at. Walking the levels
+	/// down past nothing hands the seller lots given away for zero - a fill the trader can read as a
+	/// total loss on that part of the order, produced by the engine rather than by the market.
+	/// </summary>
+	[TestMethod]
+	public async Task ABookDeepenedForALargeSellNeverBuysAtNothing()
+	{
+		const long tx = 9702;
+
+		var engine = new MatchingEngineAdapter();
+		engine.Settings.IncreaseDepthVolume = true;
+
+		var run = new EngineRun(engine);
+
+		// A cheap instrument whose step is large next to its price: walking the bids down reaches zero fast.
+		await run.SendAsync(new SecurityMessage
+		{
+			SecurityId = _securityId,
+			PriceStep = 1m,
+			VolumeStep = 1m,
+		}, CancellationToken);
+
+		await run.SendAsync(VenueBook(_securityId, _start,
+			[new QuoteChange(3m, 1m)], [new QuoteChange(4m, 1m)]), CancellationToken);
+
+		await run.SendAsync(NewOrder(tx, "Client", Sides.Sell, OrderTypes.Market, 0m, 1000m, _start.AddSeconds(1)), CancellationToken);
+
+		var fills = run.Executions.Where(m => m.HasTradeInfo() && m.OriginalTransactionId == tx).ToArray();
+
+		IsNotEmpty(fills, "a market sell into a book being deepened for it has to fill somewhere");
+		IsTrue(fills.All(m => m.TradePrice > 0m),
+			$"a price of zero or less is not a price anyone could have traded at; prices were {fills.Select(m => m.TradePrice.ToString()).JoinComma()}");
+	}
+
+	/// <summary>
+	/// A stop is armed against the price the instrument trades at, and a print is the most direct
+	/// statement of that price there is. Whether the news arrives as a print or as a quoted last
+	/// price, the stop has to move the same way: a stop that answers only one of the two sits idle
+	/// through the move it was placed for, and the protection the trader paid for never fires.
+	/// </summary>
+	[TestMethod]
+	public async Task APrintPastAStopsPriceTriggersItJustAsAQuotedLastPriceDoes()
+	{
+		const string account = "Client";
+		const long stopTx = 9703;
+
+		static OrderRegisterMessage ArmedStop()
+		{
+			var stop = NewOrder(stopTx, account, Sides.Buy, OrderTypes.Conditional, 0m, 3m, _start.AddSeconds(1));
+			stop.Condition = new StopOrderCondition { ActivationPrice = 105m };
+			return stop;
+		}
+
+		static decimal FilledBy(EngineRun run)
+			=> run.Executions
+				.Where(m => m.HasTradeInfo() && m.OriginalTransactionId == stopTx)
+				.Sum(m => m.TradeVolume ?? 0m);
+
+		var printRun = new EngineRun(new MatchingEngineAdapter());
+
+		await printRun.SendAsync(VenueBook(_securityId, _start,
+			[new QuoteChange(100m, 10m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+		await printRun.SendAsync(ArmedStop(), CancellationToken);
+		await printRun.SendAsync(new ExecutionMessage
+		{
+			DataTypeEx = DataType.Ticks,
+			SecurityId = _securityId,
+			LocalTime = _start.AddSeconds(2),
+			ServerTime = _start.AddSeconds(2),
+			TradePrice = 106m,
+			TradeVolume = 1m,
+			TradeId = 1,
+		}, CancellationToken);
+
+		var quoteRun = new EngineRun(new MatchingEngineAdapter());
+
+		await quoteRun.SendAsync(VenueBook(_securityId, _start,
+			[new QuoteChange(100m, 10m)], [new QuoteChange(101m, 10m)]), CancellationToken);
+		await quoteRun.SendAsync(ArmedStop(), CancellationToken);
+		await quoteRun.SendAsync(new Level1ChangeMessage
+		{
+			SecurityId = _securityId,
+			LocalTime = _start.AddSeconds(2),
+			ServerTime = _start.AddSeconds(2),
+		}
+		.Add(Level1Fields.LastTradePrice, 106m), CancellationToken);
+
+		var byPrint = FilledBy(printRun);
+		var byQuote = FilledBy(quoteRun);
+
+		AreEqual(3m, byQuote, "a last price past the activation price arms and fills the stop in full");
+		AreEqual(byQuote, byPrint, $"and a print at the same price has to do the same: printed {byPrint}, quoted {byQuote}");
 	}
 }
